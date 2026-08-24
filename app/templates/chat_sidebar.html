@@ -1,0 +1,12 @@
+<aside class="chat-rail" aria-label="conversations">
+  <a class="new-chat{% if new_mode %} active{% endif %}" href="/?new=1">new message</a>
+  <div class="rail-conversations">
+    {% for item in conversations %}
+    <a class="rail-conversation{% if active_room and item.room.id == active_room.id %} active{% elif item.unread %} attention{% endif %}" href="/rooms/{{ item.room.id }}">
+      <span>{% if active_room and item.room.id == active_room.id %}&gt; {% elif item.unread %}* {% else %}&nbsp;&nbsp;{% endif %}{{ item.label }}</span>
+    </a>
+    {% else %}
+    <span class="dim">no conversations</span>
+    {% endfor %}
+  </div>
+</aside>

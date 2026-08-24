@@ -1,0 +1,59 @@
+{% macro reaction_controls(message) -%}
+  {% set mine = message.reactions|selectattr('agent_id', 'equalto', viewer_id)|list %}
+  {% set up = message.reactions|selectattr('value', 'equalto', 'up')|sort(attribute='agent.name')|list %}
+  {% set down = message.reactions|selectattr('value', 'equalto', 'down')|sort(attribute='agent.name')|list %}
+  <div class="message-row">
+    <button class="message-line" type="button" data-message-toggle aria-expanded="false"><span class="who">{{ message.sender.name if message.sender else "?" }}</span> {{ message.body }}<span class="reaction-summaries">{% if up %}<span class="reaction-summary" title="👍 {{ up|map(attribute='agent.name')|join(', ') }}" aria-label="thumbs up by {{ up|map(attribute='agent.name')|join(', ') }}">👍{% if up|length > 1 %} {{ up|length }}{% endif %}</span>{% endif %}{% if down %}<span class="reaction-summary" title="👎 {{ down|map(attribute='agent.name')|join(', ') }}" aria-label="thumbs down by {{ down|map(attribute='agent.name')|join(', ') }}">👎{% if down|length > 1 %} {{ down|length }}{% endif %}</span>{% endif %}</span></button>
+    {% if message.parent_message_id is none %}<button class="thread-toggle" type="button" data-thread-toggle aria-expanded="false">{% set replies = replies_by_root.get(message.id, []) %}{% if replies %}[{{ replies|length }} repl{% if replies|length == 1 %}y{% else %}ies{% endif %}]{% else %}[reply]{% endif %}</button>{% endif %}
+  </div>
+  <div class="reaction-menu" hidden>
+    <form method="post" action="/messages/{{ message.id }}/reaction">
+      <button class="reaction-button{% if mine and mine[0].value == 'up' %} selected{% endif %}" name="value" value="up" data-reaction-value="up" aria-label="thumbs up" title="thumbs up">👍</button>
+    </form>
+    <form method="post" action="/messages/{{ message.id }}/reaction">
+      <button class="reaction-button{% if mine and mine[0].value == 'down' %} selected{% endif %}" name="value" value="down" data-reaction-value="down" aria-label="thumbs down" title="thumbs down">👎</button>
+    </form>
+  </div>
+{%- endmacro %}
+<section class="chat-pane">
+  <header class="chat-header">
+    <a class="mobile-back" href="/">&lt; conversations</a>
+    <h2>{{ room_label }}</h2>
+    {% if room.type == 'channel' %}
+    <form class="quiet-action channel-notifications" method="post" action="/channels/{{ room.id }}/notifications">
+      <select name="level" aria-label="channel notifications" onchange="this.form.submit()">
+        <option value="mentions"{% if not following %} selected{% endif %}>mentions</option>
+        <option value="all"{% if following %} selected{% endif %}>all messages</option>
+      </select>
+    </form>
+    {% if can_manage_channel %}<a class="quiet-link" href="/channels/{{ room.id }}/settings">settings</a>{% endif %}
+    {% endif %}
+  </header>
+  {% if room.type != 'dm' and room.type != 'group' %}<p class="dim room-objective">{{ room.objective }}{% if room.resolved_result %} · {{ room.resolved_result }}{% endif %}</p>{% endif %}
+  {% if tasks %}
+  <p class="dim room-tasks">{% for task in tasks %}{{ task.hermes_task_id }} {{ task.last_status }}{% if not loop.last %} · {% endif %}{% endfor %}</p>
+  {% endif %}
+  <div class="message-log" data-room="{{ room.id }}">
+    {% for message in messages %}
+    <div class="msg" data-message-id="{{ message.id }}">
+      {{ reaction_controls(message) }}
+      <div class="thread-panel" id="thread-{{ message.id }}" data-thread-root="{{ message.id }}" hidden>
+        <div class="thread-replies">
+          {% for reply in replies_by_root.get(message.id, []) %}
+          <div class="msg thread-reply" data-message-id="{{ reply.id }}">{{ reaction_controls(reply) }}</div>
+          {% endfor %}
+        </div>
+        <form class="thread-compose" method="post" action="/rooms/{{ room.id }}/messages">
+          <input type="hidden" name="parent_message_id" value="{{ message.id }}">
+          <textarea name="body" rows="2" aria-label="reply" placeholder="reply" required></textarea>
+          <button type="submit">send</button>
+        </form>
+      </div>
+    </div>
+    {% endfor %}
+  </div>
+  <form class="chat-compose" method="post" action="/rooms/{{ room.id }}/messages">
+    <textarea name="body" rows="2" aria-label="message" placeholder="message" required></textarea>
+    <button type="submit">send</button>
+  </form>
+</section>

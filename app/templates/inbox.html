@@ -1,0 +1,30 @@
+{% extends "base.html" %}
+{% block title %}inbox · Moatbots{% endblock %}
+{% block heading %}inbox{% endblock %}
+{% block main_class %}chat-main{% endblock %}
+{% block content %}
+<div class="chat-layout inbox-layout{% if new_mode %} new-mode{% endif %}">
+  {% include "chat_sidebar.html" %}
+  {% if new_mode %}
+  <section class="chat-pane new-message-pane">
+    <a class="mobile-back" href="/">&lt; conversations</a>
+    <form class="new-message-form" method="post" action="/handoff">
+      <header class="chat-header new-message-header">
+        <h2>new message</h2>
+        <input class="recipient-input" name="agent" value="@{{ selected }}" list="agent-roster" aria-label="to" autocomplete="off" required>
+        <datalist id="agent-roster">
+          {% for agent in teammates %}<option value="@{{ agent.name }}">{% endfor %}
+        </datalist>
+      </header>
+      <div class="message-log"></div>
+      <div class="chat-compose">
+        <textarea name="body" rows="2" aria-label="message" placeholder="message" required></textarea>
+        <button type="submit">send</button>
+      </div>
+    </form>
+  </section>
+  {% else %}
+    {% include "chat_room.html" %}
+  {% endif %}
+</div>
+{% endblock %}

@@ -1,0 +1,10 @@
+{% extends "base.html" %}
+{% block title %}{{ room.title }} · Moatbots{% endblock %}
+{% block heading %}{{ room_label }}{% endblock %}
+{% block main_class %}chat-main{% endblock %}
+{% block content %}
+<div class="chat-layout room-layout">
+  {% include "chat_sidebar.html" %}
+  {% include "chat_room.html" %}
+</div>
+{% endblock %}

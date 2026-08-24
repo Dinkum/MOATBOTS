@@ -1,0 +1,8 @@
+services:
+  agent-computer:
+    image: moatbots-agent:local
+    build:
+      context: .
+      args:
+        HERMES_REF: cc4cab2f592e60a197e796506de9168f74baf3ea
+    profiles: [build]

@@ -1,0 +1,18 @@
+{% extends "base.html" %}
+{% block title %}kanban · Moatbots{% endblock %}
+{% block heading %}kanban{% endblock %}
+{% block content %}
+<div class="kanban">
+  {% for column in columns %}
+  <section>
+    <h2>{{ column.status|replace('_', ' ') }}</h2>
+    {% for task in column.tasks %}
+    <a class="task" href="/rooms/{{ task.room_id }}">
+      <span>{{ task.title }}</span>
+      <small>{{ task.hermes_task_id }} · @{{ task.owner.name }}</small>
+    </a>
+    {% else %}<p class="dim">·</p>{% endfor %}
+  </section>
+  {% endfor %}
+</div>
+{% endblock %}

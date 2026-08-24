@@ -1,0 +1,54 @@
+host: 127.0.0.1
+port: 8080
+debug_logging: false
+database_url: sqlite+aiosqlite:///data/app.db
+public_url: http://127.0.0.1:8080
+
+# The host control plane invokes pinned Hermes inside one shared Docker computer.
+hermes_binary: scripts/hermes-docker.sh
+hermes_home: .moatbots-agents/chief
+hermes_timeout_seconds: 300
+agent_workspace: workspace
+agent_state_dir: .moatbots-agents
+agent_shared_dir: .moatbots-kanban
+agent_auth_dir: .moatbots-auth
+agent_desktop_dir: .moatbots-desktop
+agent_image: moatbots-agent:local
+agent_container_name: moatbots-agent-desktop
+agent_desktop_host: 127.0.0.1
+agent_desktop_port: 43128
+agent_api_url: http://host.docker.internal:43127
+agent_api_host: 0.0.0.0
+agent_api_port: 43127
+
+# How Hermes profiles get a model. auto picks the first signed-in method.
+# grok_build = Grok Build browser session (~/.grok/auth.json) via Hermes xai-oauth
+# codex = Codex / ChatGPT browser session (~/.codex/auth.json) via Hermes openai-codex
+# openrouter = OPENROUTER_API_KEY
+inference:
+  default: auto
+  openrouter_model: x-ai/grok-4.5
+  reasoning_effort: medium
+
+# How the team reaches you. Rooms stay the record. Telegram is the first adapter.
+portal:
+  kind: none
+
+budgets:
+  max_turns: 24
+  max_handoffs: 6
+  max_concurrency: 1
+  max_cost_usd: 2.0
+  max_active_agents: 8
+  max_group_participants: 3
+  max_group_rounds: 6
+
+# Chief is the only preset teammate. Chief hires the durable organization.
+primary_agent: chief
+
+agents:
+  - name: chief
+    profile: chief
+    role_title: Chief of Staff
+    job_description: Runs the organization, assigns work, and decides when the team needs a new specialist. Reuses qualified teammates before making a durable hire.
+    capabilities: [monitor, coordinate, dispatch]

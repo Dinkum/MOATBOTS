@@ -1,0 +1,18 @@
+{% extends "base.html" %}
+{% block title %}@{{ agent.name }} · Moatbots{% endblock %}
+{% block heading %}@{{ agent.name }}{% endblock %}
+{% block content %}
+<p><a href="/agents">&lt; org chart</a></p>
+<dl class="profile">
+  <dt>handle</dt><dd>@{{ agent.name }}</dd>
+  <dt>role</dt><dd>{{ agent.role_title }}</dd>
+  <dt>job</dt><dd>{{ agent.job_description }}</dd>
+  <dt>reports to</dt><dd>{% if manager %}<a href="/agents/{{ manager.name }}">@{{ manager.name }}</a>{% else %}you{% endif %}</dd>
+  <dt>direct reports</dt><dd>{% for report in direct_reports %}<a href="/agents/{{ report.name }}">@{{ report.name }}</a>{% if not loop.last %}, {% endif %}{% else %}none{% endfor %}</dd>
+</dl>
+<div class="profile-actions">
+  {% if viewer.id != agent.id %}<a href="/?to={{ agent.name }}">message</a>{% endif %}
+  <a href="/computer" target="_blank" rel="noopener">computer</a>
+  <form method="post" action="/agents/{{ agent.name }}/impersonate"><button>impersonate</button></form>
+</div>
+{% endblock %}

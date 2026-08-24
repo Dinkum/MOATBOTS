@@ -1,0 +1,14 @@
+{% extends "base.html" %}
+{% block title %}activity · Moatbots{% endblock %}
+{% block heading %}activity{% endblock %}
+{% block content %}
+<table>
+  {% for item in activity %}
+  <tr>
+    <td class="dim">{{ item.created_at.strftime('%H:%M:%S') }}</td>
+    <td class="dim">{{ item.kind }}</td>
+    <td>{{ item.title }}</td>
+  </tr>
+  {% endfor %}
+</table>
+{% endblock %}

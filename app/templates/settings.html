@@ -1,0 +1,39 @@
+{% extends "base.html" %}
+{% block title %}settings · Moatbots{% endblock %}
+{% block heading %}settings{% endblock %}
+{% block content %}
+<p>inference · {% if auth.method(auth.selected).ready %}{{ auth.selected }}{% else %}not configured{% endif %}</p>
+<table>
+  {% for method in [auth.grok_build, auth.codex, auth.openrouter] %}
+  <tr>
+    <td>{{ method.label }}</td>
+    <td class="dim">{% if method.hermes_ready %}ready{% elif method.signed_in %}signed in{% else %}—{% endif %}</td>
+    <td class="dim">{{ method.account }}</td>
+    <td>
+      {% if method.kind == 'browser' %}
+      <form method="post" action="/settings/login/{{ method.id }}"><button>login</button></form>
+      {% endif %}
+    </td>
+  </tr>
+  {% endfor %}
+</table>
+<form method="post" action="/settings/openrouter">
+  <label>openrouter key
+    <input type="password" name="key" autocomplete="off">
+  </label>
+  <button>save</button>
+</form>
+<hr>
+<p>portal · {{ portal_kind }}{% if portal_ready %} ready{% endif %}</p>
+<form method="post" action="/settings/portal">
+  <label>telegram bot token
+    <input type="password" name="token" autocomplete="off">
+  </label>
+  <label>telegram chat id
+    <input name="chat_id" value="{{ telegram_chat_id }}" autocomplete="off">
+  </label>
+  <button>save</button>
+</form>
+<p class="dim">set portal.kind: telegram in config.yaml. one office bot. rooms stay the record.</p>
+<p><a href="/activity">activity log</a></p>
+{% endblock %}

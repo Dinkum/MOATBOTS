@@ -1,0 +1,34 @@
+# Root Markdown is private unless explicitly whitelisted.
+/*.md
+!/README.md
+
+# Local operator state.
+.env
+config.yaml
+data/
+architecture/
+.moatbots-home/
+.moatbots-agents/
+.moatbots-auth/
+.moatbots-desktop/
+.moatbots-kanban/
+.hermes-home/
+.vendor/
+workspace/*
+!workspace/.gitkeep
+scratchpad.md
+STANDARDS.md
+standards.md
+
+# Python.
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.coverage
+
+# Editor and OS state.
+.DS_Store
+.idea/
+.vscode/

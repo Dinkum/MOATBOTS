@@ -1,0 +1,74 @@
+{% extends "base.html" %}
+{% block title %}groups · Moatbots{% endblock %}
+{% block heading %}groups{% endblock %}
+{% block content %}
+<div class="group-actions">
+  <details>
+    <summary>new group chat</summary>
+    <form method="post" action="/groups">
+      <input type="hidden" name="kind" value="group">
+      <fieldset>
+        <legend>people (3 total max)</legend>
+        {% for agent in teammates %}
+        <label class="check"><input type="checkbox" name="participants" value="{{ agent.name }}"> @{{ agent.name }}</label>
+        {% endfor %}
+      </fieldset>
+      <button>start</button>
+    </form>
+  </details>
+  <details>
+    <summary>new channel</summary>
+    <form method="post" action="/groups">
+      <input type="hidden" name="kind" value="channel">
+      <label>name <input name="title" placeholder="project-name" required></label>
+      <label>description <textarea name="description" rows="2" required></textarea></label>
+      <fieldset>
+        <legend>members</legend>
+        {% for agent in teammates %}
+        <label class="check"><input type="checkbox" name="participants" value="{{ agent.name }}"> @{{ agent.name }}</label>
+        {% endfor %}
+      </fieldset>
+      <fieldset>
+        <legend>additional owners</legend>
+        {% for agent in teammates %}
+        <label class="check"><input type="checkbox" name="owners" value="{{ agent.name }}"> @{{ agent.name }}</label>
+        {% endfor %}
+      </fieldset>
+      <button>create</button>
+    </form>
+  </details>
+</div>
+
+<h2>group chats</h2>
+<div class="room-list">
+  {% for item in group_chats %}
+  <div class="room-row simple-row">
+    <a href="/rooms/{{ item.room.id }}">{{ item.label }}</a>
+    <span class="dim">{{ item.room.memberships|length }} people</span>
+  </div>
+  {% else %}<p class="dim">none</p>{% endfor %}
+</div>
+
+<div class="section-line">
+  <h2>channels</h2>
+  <form class="inline-search" method="get" action="/groups">
+    <input name="q" value="{{ query }}" placeholder="search channels" aria-label="search channels">
+  </form>
+</div>
+<div class="room-list">
+  {% for room in joined %}
+  <div class="room-row">
+    <a href="/rooms/{{ room.id }}">#{{ room.title }}</a>
+    <span class="dim">{{ room.objective }}</span>
+    <span class="dim">joined</span>
+  </div>
+  {% endfor %}
+  {% for room in directory %}
+  <div class="room-row">
+    <span>#{{ room.title }}</span>
+    <span class="dim">{{ room.objective }}</span>
+    <form method="post" action="/groups/{{ room.id }}/follow"><button>join</button></form>
+  </div>
+  {% else %}{% if not joined %}<p class="dim">none</p>{% endif %}{% endfor %}
+</div>
+{% endblock %}

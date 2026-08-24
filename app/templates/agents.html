@@ -1,0 +1,12 @@
+{% extends "base.html" %}
+{% block title %}agents · Moatbots{% endblock %}
+{% block heading %}agents{% endblock %}
+{% block content %}
+<form class="inline-search agent-search" method="get" action="/agents">
+  <input name="q" value="{{ query }}" placeholder="search agents" aria-label="search agents">
+</form>
+<pre class="org">{% for row in org_rows %}{{ row.prefix }}<a href="/agents/{{ row.name }}">{{ row.name }}</a>  <span>{{ row.title }}</span>  [{{ row.status }}]
+{{ row.description_prefix }}<span>{{ row.description }}</span>
+{% else %}<span>none</span>
+{% endfor %}</pre>
+{% endblock %}
