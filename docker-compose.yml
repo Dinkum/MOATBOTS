@@ -4,5 +4,5 @@ services:
     build:
       context: .
       args:
-        HERMES_REF: cc4cab2f592e60a197e796506de9168f74baf3ea
+        HERMES_REF: fcbd1076a93841fa88855acce810e342a5b78101
     profiles: [build]

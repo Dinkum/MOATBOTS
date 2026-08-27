@@ -20,6 +20,7 @@ from app.routes import agent_api, api, pages
 from app.runtime.hermes import HermesRuntime
 from app.seed import seed_roster
 from app.services.auth import AuthService
+from app.services.demonstrations import DemonstrationService
 from app.services.desktop import DesktopService
 from app.services.inbox import accept_human_text
 from app.services.kanban import HermesKanban
@@ -44,6 +45,7 @@ async def lifespan(app: FastAPI):
     signal = NewEventSignal()
     auth = AuthService(settings)
     desktop = DesktopService(settings)
+    demonstrations = DemonstrationService("scripts/agent-computer.sh", settings.agent_workspace)
     portal = ManagedPortal(build_portal(settings))
     kanban = HermesKanban(settings.hermes_binary, settings.hermes_home)
     runtime = HermesRuntime(settings, auth)
@@ -53,17 +55,46 @@ async def lifespan(app: FastAPI):
         state_root=settings.agent_state_dir,
     )
     async with session_factory() as session:
-        team = TeamService(session, clock, kanban, signal, settings.budgets, portal, profiles)
+        team = TeamService(
+            session,
+            clock,
+            kanban,
+            signal,
+            settings.budgets,
+            portal,
+            profiles,
+            settings.agent_state_dir,
+            settings.agent_workspace,
+        )
         await seed_roster(session, settings, team)
         await session.commit()
     dispatcher = Dispatcher(
-        session_factory, clock, kanban, signal, runtime, settings.budgets, portal, profiles
+        session_factory,
+        clock,
+        kanban,
+        signal,
+        runtime,
+        settings.budgets,
+        portal,
+        profiles,
+        settings.agent_state_dir,
+        settings.agent_workspace,
     )
 
     async def on_portal_text(text: str) -> None:
         default = portal.last_peer or (settings.agents[0].name if settings.agents else "chief")
         async with session_factory() as session:
-            team = TeamService(session, clock, kanban, signal, settings.budgets, portal, profiles)
+            team = TeamService(
+                session,
+                clock,
+                kanban,
+                signal,
+                settings.budgets,
+                portal,
+                profiles,
+                settings.agent_state_dir,
+                settings.agent_workspace,
+            )
             peer = await accept_human_text(team, text, default)
             portal.last_peer = peer
             await session.commit()
@@ -76,6 +107,7 @@ async def lifespan(app: FastAPI):
     app.state.signal = signal
     app.state.auth = auth
     app.state.desktop = desktop
+    app.state.demonstrations = demonstrations
     app.state.portal = portal
     app.state.profiles = profiles
     app.state.dispatcher = dispatcher

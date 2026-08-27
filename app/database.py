@@ -36,6 +36,33 @@ def make_session_factory(engine):
 async def create_schema(engine) -> None:
     async with engine.begin() as connection:
         await connection.run_sync(Base.metadata.create_all)
+        await connection.execute(
+            text(
+                "CREATE VIRTUAL TABLE IF NOT EXISTS message_fts "
+                "USING fts5(body, content='message', content_rowid='rowid')"
+            )
+        )
+        await connection.execute(
+            text(
+                "CREATE TRIGGER IF NOT EXISTS message_fts_ai AFTER INSERT ON message BEGIN "
+                "INSERT INTO message_fts(rowid, body) VALUES (new.rowid, new.body); END"
+            )
+        )
+        await connection.execute(
+            text(
+                "CREATE TRIGGER IF NOT EXISTS message_fts_ad AFTER DELETE ON message BEGIN "
+                "INSERT INTO message_fts(message_fts, rowid, body) "
+                "VALUES ('delete', old.rowid, old.body); END"
+            )
+        )
+        await connection.execute(
+            text(
+                "CREATE TRIGGER IF NOT EXISTS message_fts_au AFTER UPDATE OF body ON message BEGIN "
+                "INSERT INTO message_fts(message_fts, rowid, body) "
+                "VALUES ('delete', old.rowid, old.body); "
+                "INSERT INTO message_fts(rowid, body) VALUES (new.rowid, new.body); END"
+            )
+        )
         # Partial unique index is declared on the model; create_all emits it on SQLite.
         await connection.execute(text("SELECT 1"))
 

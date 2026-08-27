@@ -63,16 +63,19 @@ class HermesKanban(KanbanBoard):
         self.home = Path(home).expanduser() if home else None
 
     async def create(self, title: str, assignee: str, body: str) -> KanbanTask:
-        raw = await self._run(
+        command = [
             "kanban",
             "create",
             title,
-            "--assignee",
-            assignee,
             "--body",
             body,
+            "--created-by",
+            "moatbots",
             "--json",
-        )
+        ]
+        if assignee:
+            command.extend(["--assignee", assignee])
+        raw = await self._run(*command)
         payload = _first_json(raw)
         task_id = str(payload.get("id") or payload.get("task_id") or payload.get("task"))
         status = str(payload.get("status") or "todo")

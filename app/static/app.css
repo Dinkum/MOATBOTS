@@ -172,8 +172,8 @@ legend { color: var(--dim); padding: 0; }
 .org a { color: var(--fg); }
 .org a:first-child { color: var(--accent); }
 
-.msg { margin: 0.15rem 0; }
-.message-row { display: flex; align-items: baseline; }
+.msg { margin: 0.25rem 0 0.45rem; }
+.message-row { display: flex; align-items: flex-start; }
 .message-line {
   display: block;
   width: 100%;
@@ -182,14 +182,30 @@ legend { color: var(--dim); padding: 0; }
   background: transparent;
   color: var(--fg);
   text-align: left;
-  white-space: pre-wrap;
-  overflow-wrap: anywhere;
 }
 .message-row .message-line { flex: 1; min-width: 0; }
 .message-line:hover, .message-line[aria-expanded="true"] { background: #181a17; }
-.msg .who { color: var(--dim); }
+.message-meta { display: flex; gap: 0.6rem; align-items: baseline; }
+.msg .who { color: var(--fg); font-weight: 600; }
+.message-time { color: var(--dim); font-size: 0.78rem; font-weight: 400; }
+.message-content { display: block; white-space: pre-wrap; overflow-wrap: anywhere; }
+.day-divider {
+  display: flex;
+  gap: 0.75rem;
+  align-items: center;
+  margin: 0.9rem 0.5rem 0.7rem;
+  color: var(--dim);
+  font-size: 0.78rem;
+}
+.day-divider::before, .day-divider::after {
+  flex: 1;
+  border-top: 1px solid var(--line);
+  content: "";
+}
+.day-divider time { white-space: nowrap; }
 .thread-toggle {
   flex: none;
+  margin-top: 0.15rem;
   padding: 0.15rem 0.35rem;
   border: 0;
   color: var(--dim);
@@ -224,6 +240,11 @@ legend { color: var(--dim); padding: 0; }
   color: var(--fg);
 }
 .reaction-button.selected { border-color: var(--accent); background: #202017; }
+.message-artifacts { padding: 0 0.5rem 0.45rem; }
+.message-artifacts a { margin-right: 0.7rem; color: var(--accent); }
+.search-result, .request-row { padding: 0.55rem 0; border-bottom: 1px solid var(--line); }
+.search-result .who, .request-row .who { color: var(--dim); }
+.request-row form { margin: 0.55rem 0; }
 table { border-collapse: collapse; width: 100%; }
 td, th { text-align: left; padding: 0.2rem 0.6rem 0.2rem 0; vertical-align: top; }
 hr { border: 0; border-top: 1px solid var(--line); }

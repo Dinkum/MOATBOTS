@@ -1,22 +1,28 @@
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
+from sqlalchemy import select
 
+from app.clock import utc_iso
 from app.config import get_settings
 from app.deps import get_team
 from app.errors import NotFound, TeamError
+from app.models import Demonstration
 from app.services.auth import upsert_env
 from app.services.portal import build_portal
 from app.services.team import TeamService
 
 router = APIRouter()
 templates = Jinja2Templates(directory="app/templates")
+templates.env.filters["from_json"] = json.loads
+templates.env.filters["utc_iso"] = utc_iso
 
 
 async def _viewer(request: Request, team: TeamService):
@@ -42,6 +48,7 @@ async def _ctx(
     viewer = viewer or await _viewer(request, team)
     if inbox_items is None:
         inbox_items = await team.list_inbox(viewer)
+    human_requests = await team.list_human_requests() if viewer.kind == "human" else []
     return {
         "request": request,
         "app_version": request.app.state.version,
@@ -50,6 +57,7 @@ async def _ctx(
         "viewer": viewer,
         "impersonating": viewer.name != "you",
         "show_heading": show_heading,
+        "human_requests_pending": len(human_requests),
         **extra,
     }
 
@@ -405,6 +413,66 @@ async def activity_page(request: Request, team: TeamService = Depends(get_team))
     )
 
 
+@router.get("/search", response_class=HTMLResponse)
+async def search_page(request: Request, team: TeamService = Depends(get_team)):
+    viewer = await _viewer(request, team)
+    query = request.query_params.get("q", "").strip()
+    messages = await team.search_messages(viewer, query) if query else []
+    rooms = {room.id: room for room in await team.list_rooms()}
+    return templates.TemplateResponse(
+        "search.html",
+        await _ctx(
+            request,
+            team,
+            viewer=viewer,
+            query=query,
+            messages=messages,
+            rooms=rooms,
+            section="search",
+            show_heading=True,
+        ),
+    )
+
+
+@router.get("/requests", response_class=HTMLResponse)
+async def requests_page(request: Request, team: TeamService = Depends(get_team)):
+    viewer = await _viewer(request, team)
+    if viewer.kind != "human":
+        return RedirectResponse("/", status_code=303)
+    requests = await team.list_human_requests(include_resolved=True)
+    return templates.TemplateResponse(
+        "requests.html",
+        await _ctx(
+            request,
+            team,
+            viewer=viewer,
+            human_requests=requests,
+            section="requests",
+            show_heading=True,
+        ),
+    )
+
+
+@router.post("/requests/{request_id}/resolve")
+async def resolve_request(request_id: str, request: Request, team: TeamService = Depends(get_team)):
+    form = await request.form()
+    await team.resolve_human_request(
+        await _viewer(request, team), request_id, str(form.get("response") or "")
+    )
+    return RedirectResponse("/requests", status_code=303)
+
+
+@router.get("/artifacts/{artifact_id}")
+async def artifact_file(artifact_id: str, request: Request, team: TeamService = Depends(get_team)):
+    artifact = await team.get_artifact(await _viewer(request, team), artifact_id)
+    if artifact.kind == "url":
+        return RedirectResponse(artifact.reference, status_code=303)
+    path = (team.workspace_dir / artifact.reference).resolve()
+    if not path.is_relative_to(team.workspace_dir) or not path.is_file():
+        raise HTTPException(status_code=404, detail="Artifact file is unavailable")
+    return FileResponse(path, media_type=artifact.mime_type, filename=artifact.label)
+
+
 @router.get("/agents", response_class=HTMLResponse)
 async def agents_page(request: Request, team: TeamService = Depends(get_team)):
     viewer = await _viewer(request, team)
@@ -460,6 +528,48 @@ async def shared_computer(request: Request):
     except TeamError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     return RedirectResponse(request.app.state.desktop.url, status_code=303)
+
+
+@router.get("/teach", response_class=HTMLResponse)
+async def teach_page(request: Request, team: TeamService = Depends(get_team)):
+    viewer = await _viewer(request, team)
+    agents = [agent for agent in await team.list_agents() if agent.kind != "human"]
+    demonstrations = list(
+        (
+            await team.db.execute(
+                select(Demonstration).order_by(Demonstration.created_at.desc()).limit(40)
+            )
+        ).scalars()
+    )
+    return templates.TemplateResponse(
+        "teach.html",
+        await _ctx(
+            request,
+            team,
+            viewer=viewer,
+            agents=agents,
+            demonstrations=demonstrations,
+            section="teach",
+            show_heading=True,
+        ),
+    )
+
+
+@router.post("/teach/start")
+async def start_teach(request: Request, team: TeamService = Depends(get_team)):
+    form = await request.form()
+    agent = await team.get_agent(str(form.get("agent") or "chief"))
+    await request.app.state.desktop.start()
+    await request.app.state.demonstrations.start(team, agent, str(form.get("title") or ""))
+    return RedirectResponse("/teach", status_code=303)
+
+
+@router.post("/teach/{demonstration_id}/stop")
+async def stop_teach(
+    demonstration_id: str, request: Request, team: TeamService = Depends(get_team)
+):
+    await request.app.state.demonstrations.stop(team, demonstration_id)
+    return RedirectResponse("/teach", status_code=303)
 
 
 @router.post("/agents/{agent_name}/impersonate")

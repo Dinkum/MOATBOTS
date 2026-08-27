@@ -5,6 +5,7 @@ from pathlib import Path
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from pydantic import BaseModel, Field
 
+from app.clock import utc_iso
 from app.deps import get_team
 from app.errors import NotFound, TeamError
 from app.services.team import TeamService
@@ -14,6 +15,14 @@ router = APIRouter()
 
 class HookBody(BaseModel):
     payload: dict = Field(default_factory=dict)
+    agent: str | None = None
+    dedupe_key: str | None = None
+
+
+class EventBody(BaseModel):
+    action: str = ""
+    resource: dict = Field(default_factory=dict)
+    metadata: dict = Field(default_factory=dict)
     agent: str | None = None
     dedupe_key: str | None = None
 
@@ -114,6 +123,31 @@ async def ingest_hook(
     return {"accepted": len(events), "ids": [event.id for event in events if event]}
 
 
+@router.post("/api/events/{source}/{event_type}")
+async def ingest_typed_event(
+    source: str,
+    event_type: str,
+    body: EventBody,
+    request: Request,
+    team: TeamService = Depends(get_team),
+    authorization: str | None = Header(default=None),
+):
+    _require_token(request, authorization)
+    payload = {
+        "event_type": event_type,
+        "action": body.action,
+        "resource": body.resource,
+        "metadata": body.metadata,
+    }
+    events = await team.ingest_webhook(
+        source,
+        payload,
+        agent_name=body.agent,
+        dedupe_key=body.dedupe_key,
+    )
+    return {"accepted": len(events), "ids": [event.id for event in events if event]}
+
+
 @router.post("/api/rooms")
 async def create_room(
     body: RoomBody,
@@ -151,7 +185,7 @@ def serialize_messages(messages, viewer_id: str) -> dict:
                 "sender": message.sender.name if message.sender else "",
                 "body": message.body,
                 "parent_message_id": message.parent_message_id,
-                "at": message.created_at.isoformat(),
+                "at": utc_iso(message.created_at),
                 "reactions": [
                     {
                         "value": reaction.value,
@@ -159,6 +193,14 @@ def serialize_messages(messages, viewer_id: str) -> dict:
                         "mine": reaction.agent_id == viewer_id,
                     }
                     for reaction in sorted(message.reactions, key=lambda row: row.agent.name)
+                ],
+                "artifacts": [
+                    {
+                        "id": artifact.id,
+                        "label": artifact.label,
+                        "mime_type": artifact.mime_type,
+                    }
+                    for artifact in message.artifacts
                 ],
             }
             for message in messages

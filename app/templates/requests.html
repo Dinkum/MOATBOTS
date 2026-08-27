@@ -1,0 +1,24 @@
+{% extends "base.html" %}
+{% block title %}requests · Moatbots{% endblock %}
+{% block content %}
+{% for item in human_requests %}
+<section class="request-row">
+  <p><span class="who">@{{ item.agent.name }}</span> {{ item.prompt }}</p>
+  <p class="dim">{{ item.kind }} · {{ item.status }} · {{ item.id }}</p>
+  {% if item.status == 'pending' %}
+  <form method="post" action="/requests/{{ item.id }}/resolve">
+    {% if item.kind == 'choice' %}
+    <select name="response" aria-label="response">{% for option in item.options_json|from_json %}<option>{{ option }}</option>{% endfor %}</select>
+    {% elif item.kind == 'approval' %}
+    <select name="response" aria-label="response"><option>approve</option><option>deny</option></select>
+    {% elif item.kind == 'secret' %}
+    <input type="password" name="response" aria-label="{{ item.secret_name }}" autocomplete="off" required>
+    {% else %}
+    <textarea name="response" rows="2" aria-label="response" required></textarea>
+    {% endif %}
+    <button type="submit">resolve</button>
+  </form>
+  {% endif %}
+</section>
+{% else %}<p class="dim">no requests</p>{% endfor %}
+{% endblock %}

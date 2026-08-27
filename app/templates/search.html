@@ -1,0 +1,13 @@
+{% extends "base.html" %}
+{% block title %}search · Moatbots{% endblock %}
+{% block content %}
+<form class="inline-search" method="get" action="/search">
+  <input name="q" value="{{ query }}" placeholder="search conversations" aria-label="search conversations" autofocus>
+</form>
+{% if query %}
+  <p class="dim">{{ messages|length }} result{% if messages|length != 1 %}s{% endif %}</p>
+  {% for message in messages %}
+  <p class="search-result"><a href="/rooms/{{ message.room_id }}">{{ rooms[message.room_id].title }}</a> <span class="who">{{ message.sender.name }}</span> {{ message.body }}</p>
+  {% endfor %}
+{% endif %}
+{% endblock %}

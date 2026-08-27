@@ -37,8 +37,9 @@ portal:
 budgets:
   max_turns: 24
   max_handoffs: 6
-  max_concurrency: 1
-  max_cost_usd: 2.0
+  # Headless runs may overlap. The one shared desktop remains single-file.
+  max_concurrency: 3
+  wake_lease_seconds: 600
   max_active_agents: 8
   max_group_participants: 3
   max_group_rounds: 6

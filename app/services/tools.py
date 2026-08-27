@@ -20,10 +20,19 @@ TOOL_NAMES = (
     "channels.join",
     "messages.send",
     "messages.reply",
+    "messages.history",
+    "messages.search",
+    "artifacts.attach",
     "tasks.create",
     "tasks.update",
     "loops.schedule",
     "routines.create",
+    "routines.update",
+    "routines.run",
+    "routines.history",
+    "routines.delete",
+    "human.request",
+    "demonstrations.verify",
     "rooms.resolve",
     "context.load",
 )
@@ -64,10 +73,19 @@ class Toolbelt:
             "channels.join": self._join_channel,
             "messages.send": self._send,
             "messages.reply": self._reply,
+            "messages.history": self._history,
+            "messages.search": self._search,
+            "artifacts.attach": self._attach_artifact,
             "tasks.create": self._create_task,
             "tasks.update": self._update_task,
             "loops.schedule": self._schedule,
             "routines.create": self._routine,
+            "routines.update": self._update_routine,
+            "routines.run": self._run_routine,
+            "routines.history": self._routine_history,
+            "routines.delete": self._delete_routine,
+            "human.request": self._human_request,
+            "demonstrations.verify": self._verify_demonstration,
             "rooms.resolve": self._resolve,
             "context.load": self._context,
         }[name]
@@ -239,12 +257,45 @@ class Toolbelt:
         )
         return {"message": message.id, "room": message.room_id, "thread": root.id}
 
+    async def _history(self, args: dict) -> dict:
+        messages = await self.team.history(
+            str(args.get("room") or ""),
+            limit=min(int(args.get("limit") or 80), 200),
+            viewer=self.actor,
+        )
+        return {"messages": [_message_row(message) for message in messages]}
+
+    async def _search(self, args: dict) -> dict:
+        messages = await self.team.search_messages(
+            self.actor,
+            str(args.get("query") or ""),
+            room_id=str(args["room"]) if args.get("room") else None,
+            limit=min(int(args.get("limit") or 50), 100),
+        )
+        return {"messages": [_message_row(message) for message in messages]}
+
+    async def _attach_artifact(self, args: dict) -> dict:
+        artifact = await self.team.attach_artifact(
+            self.actor,
+            str(args.get("message") or ""),
+            reference=str(args.get("reference") or ""),
+            label=str(args.get("label") or ""),
+            mime_type=str(args.get("mime_type") or "application/octet-stream"),
+        )
+        return {
+            "artifact": artifact.id,
+            "kind": artifact.kind,
+            "sha256": artifact.sha256,
+            "size_bytes": artifact.size_bytes,
+        }
+
     async def _create_task(self, args: dict) -> dict:
         ref = await self.team.create_task(
             self.actor,
             args["room"],
             args["owner"],
             args.get("objective") or "",
+            str(args.get("execution_lane") or "shared"),
         )
         return {
             "task": ref.id,
@@ -282,8 +333,66 @@ class Toolbelt:
             match_any=list(match_any),
             ignore_any=list(ignore_any),
             context=args.get("context") or {},
+            max_runs=int(args["max_runs"]) if args.get("max_runs") else None,
+            expires_at=_date(args.get("expires_at")),
         )
         return {"routine": routine.id, "source": routine.source}
+
+    async def _update_routine(self, args: dict) -> dict:
+        routine = await self.team.update_routine(
+            self.actor,
+            str(args.get("routine") or ""),
+            active=args.get("active"),
+            reason=args.get("reason"),
+            match_any=args.get("match_any"),
+            ignore_any=args.get("ignore_any"),
+            expires_at=_date(args.get("expires_at")),
+        )
+        return {"routine": routine.id, "active": bool(routine.active)}
+
+    async def _run_routine(self, args: dict) -> dict:
+        event = await self.team.run_routine(self.actor, str(args.get("routine") or ""))
+        return {"routine": event.context_reference, "wake_event": event.id}
+
+    async def _routine_history(self, args: dict) -> dict:
+        rows = await self.team.routine_history(self.actor, str(args.get("routine") or ""))
+        return {
+            "runs": [
+                {
+                    "id": row.id,
+                    "trigger": row.trigger,
+                    "verdict": row.verdict,
+                    "wake_event": row.wake_event_id,
+                    "at": row.created_at.isoformat(),
+                }
+                for row in rows
+            ]
+        }
+
+    async def _delete_routine(self, args: dict) -> dict:
+        routine = await self.team.retire_routine(self.actor, str(args.get("routine") or ""))
+        return {"routine": routine.id, "status": "retired"}
+
+    async def _human_request(self, args: dict) -> dict:
+        request = await self.team.create_human_request(
+            self.actor,
+            kind=str(args.get("kind") or "handoff"),
+            prompt=str(args.get("prompt") or ""),
+            options=list(args.get("options") or []),
+            room_id=str(args["room"]) if args.get("room") else None,
+            secret_name=str(args["secret_name"]) if args.get("secret_name") else None,
+            expires_at=_date(args.get("expires_at")),
+        )
+        return {"request": request.id, "status": request.status, "kind": request.kind}
+
+    async def _verify_demonstration(self, args: dict) -> dict:
+        row = await self.team.verify_demonstration(
+            self.actor,
+            str(args.get("demonstration") or ""),
+            str(args.get("learned_reference") or ""),
+            str(args.get("verification_note") or ""),
+        )
+        return {"demonstration": row.id, "status": row.status}
 
     async def _resolve(self, args: dict) -> dict:
         room = await self.team.resolve_room(self.actor, args["room"], args.get("result") or "")
@@ -294,7 +403,7 @@ class Toolbelt:
 
 
 def tool_schemas() -> list[dict]:
-    return [
+    schemas = [
         {
             "name": "agents.find",
             "description": "Find named team agents by capability.",
@@ -445,6 +554,10 @@ def tool_schemas() -> list[dict]:
                     "room": {"type": "string"},
                     "owner": {"type": "string"},
                     "objective": {"type": "string"},
+                    "execution_lane": {
+                        "type": "string",
+                        "enum": ["shared", "headless"],
+                    },
                 },
                 "required": ["room", "owner", "objective"],
             },
@@ -483,8 +596,11 @@ def tool_schemas() -> list[dict]:
                     "match_any": {"type": "array", "items": {"type": "string"}},
                     "ignore_any": {"type": "array", "items": {"type": "string"}},
                     "interval_seconds": {"type": "integer"},
+                    "context": {"type": "object"},
+                    "max_runs": {"type": "integer"},
+                    "expires_at": {"type": "string"},
                 },
-                "required": ["reason", "source"],
+                "required": ["reason"],
             },
         },
         {
@@ -504,7 +620,127 @@ def tool_schemas() -> list[dict]:
             "inputSchema": {"type": "object", "properties": {}},
         },
     ]
+    schemas.extend(
+        [
+            _schema(
+                "messages.history",
+                "Load conversation history.",
+                {"room": "string", "limit": "integer"},
+                ["room"],
+            ),
+            _schema(
+                "messages.search",
+                "Search every conversation this agent can access.",
+                {"query": "string", "room": "string", "limit": "integer"},
+                ["query"],
+            ),
+            _schema(
+                "artifacts.attach",
+                "Attach an immutable workspace file or HTTPS reference to a message.",
+                {
+                    "message": "string",
+                    "reference": "string",
+                    "label": "string",
+                    "mime_type": "string",
+                },
+                ["message", "reference"],
+            ),
+            _schema(
+                "routines.update",
+                "Pause, resume, expire, or change a routine.",
+                {
+                    "routine": "string",
+                    "active": "boolean",
+                    "reason": "string",
+                    "match_any": "array",
+                    "ignore_any": "array",
+                    "expires_at": "string",
+                },
+                ["routine"],
+            ),
+            _schema("routines.run", "Run a routine now.", {"routine": "string"}, ["routine"]),
+            _schema(
+                "routines.history",
+                "Load a routine's trigger history.",
+                {"routine": "string"},
+                ["routine"],
+            ),
+            _schema(
+                "routines.delete",
+                "Retire a routine while preserving its trigger history.",
+                {"routine": "string"},
+                ["routine"],
+            ),
+            _schema(
+                "human.request",
+                "Ask the human for a choice, approval, login handoff, or secret. "
+                "Secret values never enter the conversation.",
+                {
+                    "kind": "string",
+                    "prompt": "string",
+                    "options": "array",
+                    "room": "string",
+                    "secret_name": "string",
+                    "expires_at": "string",
+                },
+                ["kind", "prompt"],
+            ),
+            _schema(
+                "demonstrations.verify",
+                "Mark a learned procedure ready after replaying it successfully.",
+                {
+                    "demonstration": "string",
+                    "learned_reference": "string",
+                    "verification_note": "string",
+                },
+                ["demonstration", "learned_reference", "verification_note"],
+            ),
+        ]
+    )
+    return schemas
 
 
 def _preview(result: dict) -> dict:
     return {key: result[key] for key in list(result)[:8]}
+
+
+def _schema(name: str, description: str, properties: dict[str, str], required: list[str]) -> dict:
+    built: dict[str, dict] = {}
+    for key, kind in properties.items():
+        if kind == "array":
+            built[key] = {"type": "array", "items": {"type": "string"}}
+        else:
+            built[key] = {"type": kind}
+    return {
+        "name": name,
+        "description": description,
+        "inputSchema": {"type": "object", "properties": built, "required": required},
+    }
+
+
+def _date(value):
+    if isinstance(value, str) and value:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    return value
+
+
+def _message_row(message: Message) -> dict:
+    return {
+        "id": message.id,
+        "room": message.room_id,
+        "sender": message.sender.name if message.sender else "",
+        "body": message.body,
+        "parent_message_id": message.parent_message_id,
+        "at": message.created_at.isoformat(),
+        "artifacts": [
+            {
+                "id": artifact.id,
+                "label": artifact.label,
+                "kind": artifact.kind,
+                "reference": artifact.reference,
+                "mime_type": artifact.mime_type,
+                "sha256": artifact.sha256,
+            }
+            for artifact in message.artifacts
+        ],
+    }

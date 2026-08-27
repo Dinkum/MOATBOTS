@@ -77,6 +77,7 @@ async def test_history_loads_reactors_for_aggregate_display(world):
         [loaded] = await team.history(room.id)
         assert sorted(reaction.agent.name for reaction in loaded.reactions) == ["chief", "you"]
         payload = serialize_messages([loaded], you.id)
+        assert payload["messages"][0]["at"] == "2026-08-14T12:00:00Z"
         assert payload["messages"][0]["reactions"] == [
             {"value": "up", "agent": "chief", "mine": False},
             {"value": "up", "agent": "you", "mine": True},
@@ -92,6 +93,11 @@ async def test_history_loads_reactors_for_aggregate_display(world):
             replies_by_root={},
             can_manage_channel=False,
         )
+        assert 'class="message-meta"' in html
+        assert '<span class="who">chief</span>' in html
+        assert 'class="message-time" datetime="2026-08-14T12:00:00Z"' in html
+        assert ">12:00 UTC</time>" in html
+        assert '<span class="message-body">ship it</span>' in html
         assert 'title="👍 chief, you"' in html
         assert ">👍 2</span>" in html
 

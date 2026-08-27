@@ -26,6 +26,8 @@ class Dispatcher:
         budgets: BudgetSettings,
         portal: Portal | None = None,
         profiles: ProfileProvisioner | None = None,
+        agent_state_dir: str = ".moatbots-agents",
+        workspace_dir: str = "workspace",
     ) -> None:
         self.session_factory = session_factory
         self.clock = clock
@@ -35,7 +37,11 @@ class Dispatcher:
         self.budgets = budgets
         self.portal = portal or NullPortal()
         self.profiles = profiles or UnavailableProfileProvisioner()
+        self.agent_state_dir = agent_state_dir
+        self.workspace_dir = workspace_dir
         self._stopped = asyncio.Event()
+        self._capacity = asyncio.Semaphore(budgets.max_concurrency)
+        self._shared_computer = asyncio.Semaphore(1)
 
     def stop(self) -> None:
         self._stopped.set()
@@ -64,22 +70,31 @@ class Dispatcher:
             async with self.session_factory() as session:
                 team = self._team(session)
                 await team.fire_due_routines_and_loops()
-                events = await team.claim_due_events()
+                events = await team.claim_due_events(limit=self.budgets.max_concurrency)
                 claimed = [event.id for event in events]
                 await session.commit()
             if not claimed:
                 return total
-            for event_id in claimed:
-                async with self.session_factory() as session:
-                    team = self._team(session)
-                    event = await session.get(WakeEvent, event_id)
-                    if event is None:
-                        continue
-                    await self._handle(team, event)
-                    await session.commit()
-                    total += 1
+            await asyncio.gather(*(self._run_claimed(event_id) for event_id in claimed))
+            total += len(claimed)
         emit("dispatcher", "unsettle", "Drain hit the round cap")
         return total
+
+    async def _run_claimed(self, event_id: str) -> None:
+        async with self._capacity, self.session_factory() as session:
+            event = await session.get(WakeEvent, event_id)
+            if event is None:
+                return
+            lane = self._shared_computer if event.execution_lane == "shared" else _NullLane()
+            async with lane:
+                team = self._team(session)
+                try:
+                    await self._handle(team, event)
+                except asyncio.CancelledError:
+                    await team.release_claim(event, "Dispatcher stopped during the run")
+                    await session.commit()
+                    raise
+                await session.commit()
 
     async def _handle(self, team: TeamService, event: WakeEvent) -> None:
         agent = await team.get_agent(event.target_id)
@@ -94,6 +109,9 @@ class Dispatcher:
             emit("dispatcher", "run.error", str(exc), agent=agent.name)
             return
         run.turns_used = result.turns
+        run.cost_usd = result.cost_usd
+        run.provider = result.provider
+        run.model = result.model
         if result.decision == "ignore":
             await team.ignore_event(event, run, result.note)
         else:
@@ -116,4 +134,14 @@ class Dispatcher:
             self.budgets,
             self.portal,
             self.profiles,
+            self.agent_state_dir,
+            self.workspace_dir,
         )
+
+
+class _NullLane:
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, traceback):
+        del exc_type, exc, traceback

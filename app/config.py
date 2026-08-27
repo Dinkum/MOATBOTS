@@ -29,8 +29,8 @@ class YAMLSettingsSource(PydanticBaseSettingsSource):
 class BudgetSettings(BaseModel):
     max_turns: int = 24
     max_handoffs: int = 6
-    max_concurrency: int = 1
-    max_cost_usd: float = 2.0
+    max_concurrency: int = Field(default=3, ge=1, le=16)
+    wake_lease_seconds: int = Field(default=600, ge=30, le=3600)
     max_active_agents: int = Field(default=8, ge=1, le=64)
     max_group_participants: int = Field(default=3, ge=2, le=8)
     max_group_rounds: int = Field(default=6, ge=1, le=24)
@@ -119,6 +119,8 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def validate_roster(self) -> Self:
+        if self.budgets.wake_lease_seconds <= self.hermes_timeout_seconds:
+            raise ValueError("wake lease must be longer than the Hermes run timeout")
         if self.agent_desktop_port == self.agent_api_port or self.agent_desktop_port == self.port:
             raise ValueError("agent desktop, tool callback, and office ports must be distinct")
         by_name = {agent.name: agent for agent in self.agents}

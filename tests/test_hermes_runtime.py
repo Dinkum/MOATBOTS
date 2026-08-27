@@ -68,13 +68,20 @@ async def test_runtime_releases_context_write_before_subprocess(world, tmp_path:
                     await other_session.commit()
                 return b"finished", b""
 
-        async def create_subprocess(*_args, **_kwargs):
+        command = []
+
+        async def create_subprocess(*args, **_kwargs):
+            command.extend(args)
             return FakeProcess()
 
         monkeypatch.setattr("app.runtime.hermes.asyncio.create_subprocess_exec", create_subprocess)
         result = await HermesRuntime(settings, FakeAuth()).run(team, chief, event, run)
 
     assert result.decision == "acted"
+    assert "--provider" not in command
+    assert "--model" not in command
+    assert result.turns is None
+    assert result.cost_usd is None
     async with world["factory"]() as session:
         assert (
             await session.execute(select(Activity).where(Activity.title == "parallel tool write"))

@@ -47,6 +47,12 @@ def main() -> None:
     skill_dir = profile / "skills" / "moatbots-team"
     skill_dir.mkdir(parents=True, exist_ok=True)
     shutil.copy2(ROOT / "share/moatbots-team/SKILL.md", skill_dir / "SKILL.md")
+    learning_dir = profile / "skills" / "moatbots-learn-demonstration"
+    learning_dir.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(
+        ROOT / "share/moatbots-learn-demonstration/SKILL.md",
+        learning_dir / "SKILL.md",
+    )
 
 
 if __name__ == "__main__":

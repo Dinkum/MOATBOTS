@@ -13,6 +13,9 @@
         <a href="/groups" class="{% if request.url.path.startswith('/groups') or request.url.path.startswith('/channels') %}on{% endif %}">groups</a>
         <a href="/kanban" class="{% if request.url.path == '/kanban' %}on{% endif %}">kanban</a>
         <a href="/agents" class="{% if request.url.path.startswith('/agents') %}on{% endif %}">agents</a>
+        <a href="/search" class="{% if request.url.path == '/search' %}on{% endif %}">search</a>
+        {% if viewer.kind == 'human' %}<a href="/teach" class="{% if request.url.path == '/teach' %}on{% endif %}">teach</a>{% endif %}
+        {% if viewer.kind == 'human' %}<a href="/requests" class="{% if request.url.path == '/requests' %}on{% endif %}">requests{% if human_requests_pending %}[{{ human_requests_pending }}]{% endif %}</a>{% endif %}
         <a href="/settings" class="{% if request.url.path == '/settings' %}on{% endif %}">settings</a>
       </span>
       {% if impersonating %}

@@ -3,7 +3,7 @@
   {% set up = message.reactions|selectattr('value', 'equalto', 'up')|sort(attribute='agent.name')|list %}
   {% set down = message.reactions|selectattr('value', 'equalto', 'down')|sort(attribute='agent.name')|list %}
   <div class="message-row">
-    <button class="message-line" type="button" data-message-toggle aria-expanded="false"><span class="who">{{ message.sender.name if message.sender else "?" }}</span> {{ message.body }}<span class="reaction-summaries">{% if up %}<span class="reaction-summary" title="👍 {{ up|map(attribute='agent.name')|join(', ') }}" aria-label="thumbs up by {{ up|map(attribute='agent.name')|join(', ') }}">👍{% if up|length > 1 %} {{ up|length }}{% endif %}</span>{% endif %}{% if down %}<span class="reaction-summary" title="👎 {{ down|map(attribute='agent.name')|join(', ') }}" aria-label="thumbs down by {{ down|map(attribute='agent.name')|join(', ') }}">👎{% if down|length > 1 %} {{ down|length }}{% endif %}</span>{% endif %}</span></button>
+    <button class="message-line" type="button" data-message-toggle aria-expanded="false"><span class="message-meta"><span class="who">{{ message.sender.name if message.sender else "?" }}</span><time class="message-time" datetime="{{ message.created_at|utc_iso }}">{{ message.created_at.strftime('%H:%M') }} UTC</time></span><span class="message-content"><span class="message-body">{{ message.body }}</span><span class="reaction-summaries">{% if up %}<span class="reaction-summary" title="👍 {{ up|map(attribute='agent.name')|join(', ') }}" aria-label="thumbs up by {{ up|map(attribute='agent.name')|join(', ') }}">👍{% if up|length > 1 %} {{ up|length }}{% endif %}</span>{% endif %}{% if down %}<span class="reaction-summary" title="👎 {{ down|map(attribute='agent.name')|join(', ') }}" aria-label="thumbs down by {{ down|map(attribute='agent.name')|join(', ') }}">👎{% if down|length > 1 %} {{ down|length }}{% endif %}</span>{% endif %}</span></span></button>
     {% if message.parent_message_id is none %}<button class="thread-toggle" type="button" data-thread-toggle aria-expanded="false">{% set replies = replies_by_root.get(message.id, []) %}{% if replies %}[{{ replies|length }} repl{% if replies|length == 1 %}y{% else %}ies{% endif %}]{% else %}[reply]{% endif %}</button>{% endif %}
   </div>
   <div class="reaction-menu" hidden>
@@ -37,6 +37,7 @@
     {% for message in messages %}
     <div class="msg" data-message-id="{{ message.id }}">
       {{ reaction_controls(message) }}
+      {% if message.artifacts %}<div class="message-artifacts">{% for artifact in message.artifacts %}<a href="/artifacts/{{ artifact.id }}">[{{ artifact.label }}]</a>{% endfor %}</div>{% endif %}
       <div class="thread-panel" id="thread-{{ message.id }}" data-thread-root="{{ message.id }}" hidden>
         <div class="thread-replies">
           {% for reply in replies_by_root.get(message.id, []) %}

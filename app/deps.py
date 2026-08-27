@@ -15,6 +15,8 @@ async def get_team(request: Request) -> AsyncIterator[TeamService]:
             request.app.state.settings.budgets,
             request.app.state.portal,
             request.app.state.profiles,
+            request.app.state.settings.agent_state_dir,
+            request.app.state.settings.agent_workspace,
         )
         try:
             yield team

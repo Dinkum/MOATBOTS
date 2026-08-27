@@ -22,7 +22,7 @@ Use what you already pay for.
 - **Codex** if you already signed into ChatGPT / Codex in the browser.
 - **OpenRouter** if you want a key and a catalog.
 
-Browser sessions stay in `~/.grok` and `~/.codex`. They are mounted read-only when the shared computer is created. Moatbots tells Hermes which `--provider` to use. An OpenRouter key you paste is written to the host-only `.env` (mode 0600) and passed to the selected agent process.
+Browser sessions stay in `~/.grok` and `~/.codex`. They are mounted read-only when the shared computer is created. Automatic profiles use Hermes' native provider routing and fallback. An explicit per-agent provider remains an operator override. An OpenRouter key you paste is written to the host-only `.env` (mode 0600) and passed to the selected agent process.
 
 ## Where is the computer?
 
@@ -34,7 +34,7 @@ The pipe between you and the team. Rooms stay the record. Agent DMs to `you` go 
 
 ## Do the agents actually decide?
 
-Yes. Each named agent has a separate Hermes profile directory. They deliberately share the same desktop session and its files. Every wake prepends `app/prompts/teammate.md`. `./scripts/install-mcp.sh` installs the `moatbots-team` skill and a container-local MCP bridge. They use Hermes for the computer and Kanban.
+Yes. Each named agent has a separate Hermes profile directory. They deliberately share the same desktop session and its files. `./scripts/install-mcp.sh` installs the always-loaded `moatbots-team` skill and a container-local MCP bridge. Identity stays in each profile's `SOUL.md`. They use Hermes for the computer and Kanban.
 
 ## Will it spam me?
 

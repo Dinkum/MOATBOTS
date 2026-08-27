@@ -55,8 +55,15 @@ class HermesRuntime(Runtime):
             ),
             None,
         )
-        provider, model, extra_env = self.auth.hermes_invocation(preferred)
+        provider = ""
+        model = ""
+        extra_env: dict[str, str] = {}
+        # Auto means Hermes owns routing and fallback. An explicit per-agent
+        # provider remains an operator override.
+        if preferred:
+            provider, model, extra_env = self.auth.hermes_invocation(preferred)
         prompt = _wake_prompt(agent, event, context)
+        event_payload = json.loads(event.payload_json or "{}")
         command = [
             str(binary.resolve()),
             "-p",
@@ -69,11 +76,12 @@ class HermesRuntime(Runtime):
             "moatbots",
             "--max-turns",
             str(run.max_turns),
-            "--provider",
-            provider,
-            "--model",
-            model,
         ]
+        if provider:
+            command.extend(["--provider", provider, "--model", model])
+        skills = event_payload.get("skills") if isinstance(event_payload, dict) else None
+        if isinstance(skills, list) and skills:
+            command.extend(["--skills", ",".join(str(item) for item in skills)])
         if agent.hermes_session_id:
             command.extend(["--resume", agent.hermes_session_id])
         environment = os.environ.copy()
@@ -94,6 +102,10 @@ class HermesRuntime(Runtime):
                 process.communicate(),
                 timeout=self.settings.hermes_timeout_seconds,
             )
+        except asyncio.CancelledError:
+            process.terminate()
+            await process.wait()
+            raise
         except TimeoutError:
             process.terminate()
             await process.wait()
@@ -105,7 +117,12 @@ class HermesRuntime(Runtime):
             agent.hermes_session_id = session_id
         if process.returncode != 0:
             return RuntimeResult("error", (diagnostic or text)[-800:])
-        return RuntimeResult("acted", text[-800:] or "hermes returned", turns=run.max_turns)
+        return RuntimeResult(
+            "acted",
+            text[-800:] or "hermes returned",
+            provider=provider,
+            model=model,
+        )
 
 
 def _session_id(diagnostic: str) -> str | None:
@@ -126,8 +143,14 @@ def _wake_prompt(agent: Agent, event: WakeEvent, context: dict) -> str:
             "the same round. Do not answer those yet. Send at most one useful response to this "
             "group; sending no group message means pass.\n"
         )
+    lane_instruction = ""
+    if event.execution_lane == "headless":
+        lane_instruction = (
+            "\nThis run is admitted to the headless lane. Do not use the shared desktop, "
+            "browser, or GUI computer tools.\n"
+        )
     return (
-        f"{round_instruction}"
+        f"{round_instruction}{lane_instruction}"
         f"Current teammate: {agent.name}.\n"
         f"Wake reason: {event.reason}\n"
         f"Context ref: {event.context_reference}\n"

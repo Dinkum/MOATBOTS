@@ -6,9 +6,10 @@ import json
 import re
 from dataclasses import dataclass
 from datetime import timedelta
+from pathlib import Path
 from typing import Any
 
-from sqlalchemy import Select, select
+from sqlalchemy import Select, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -18,6 +19,9 @@ from app.errors import BudgetExceeded, NotFound, SelfWakeRejected, TeamError
 from app.models import (
     Activity,
     Agent,
+    Artifact,
+    Demonstration,
+    HumanRequest,
     KanbanRef,
     Membership,
     Message,
@@ -27,9 +31,11 @@ from app.models import (
     Room,
     RoomRead,
     Routine,
+    RoutineRun,
     Run,
     WakeEvent,
 )
+from app.services.auth import upsert_env
 from app.services.filter import decide, mention_names, parse_list
 from app.services.kanban import KanbanBoard
 from app.services.portal import NullPortal, Portal
@@ -83,6 +89,8 @@ class TeamService:
         budgets: BudgetSettings | None = None,
         portal: Portal | None = None,
         profiles: ProfileProvisioner | None = None,
+        agent_state_dir: str = ".moatbots-agents",
+        workspace_dir: str = "workspace",
     ) -> None:
         self.db = session
         self.clock = clock
@@ -91,6 +99,8 @@ class TeamService:
         self.budgets = budgets or BudgetSettings()
         self.portal = portal or NullPortal()
         self.profiles = profiles or UnavailableProfileProvisioner()
+        self.agent_state_dir = Path(agent_state_dir).expanduser().resolve()
+        self.workspace_dir = Path(workspace_dir).expanduser().resolve()
 
     async def record(
         self,
@@ -795,6 +805,7 @@ class TeamService:
             .options(
                 selectinload(Message.sender),
                 selectinload(Message.reactions).selectinload(MessageReaction.agent),
+                selectinload(Message.artifacts),
             )
             .where(Message.room_id == room_id)
             .order_by(Message.created_at.desc())
@@ -803,6 +814,111 @@ class TeamService:
         rows = list((await self.db.execute(stmt)).scalars())
         rows.reverse()
         return rows
+
+    async def search_messages(
+        self, actor: Agent, query: str, *, room_id: str | None = None, limit: int = 50
+    ) -> list[Message]:
+        terms = re.findall(r"[\w-]+", query, flags=re.UNICODE)
+        if not terms:
+            return []
+        memberships = list(
+            (
+                await self.db.execute(
+                    select(Membership.room_id).where(Membership.agent_id == actor.id)
+                )
+            ).scalars()
+        )
+        allowed = set(memberships)
+        if room_id:
+            if room_id not in allowed:
+                raise TeamError("You are not a member of that conversation")
+            allowed = {room_id}
+        if not allowed:
+            return []
+        fts_query = " AND ".join(f'"{term.replace(chr(34), "")}"' for term in terms)
+        rows = await self.db.execute(
+            text(
+                "SELECT m.id FROM message_fts f "
+                "JOIN message m ON m.rowid = f.rowid "
+                "WHERE message_fts MATCH :query "
+                "AND m.room_id IN (SELECT value FROM json_each(:rooms)) "
+                "ORDER BY bm25(message_fts), m.created_at DESC LIMIT :limit"
+            ),
+            {"query": fts_query, "rooms": json.dumps(sorted(allowed)), "limit": min(limit, 100)},
+        )
+        ids = [row[0] for row in rows]
+        if not ids:
+            return []
+        messages = list(
+            (
+                await self.db.execute(
+                    select(Message)
+                    .options(selectinload(Message.sender), selectinload(Message.artifacts))
+                    .where(Message.id.in_(ids))
+                )
+            ).scalars()
+        )
+        by_id = {message.id: message for message in messages}
+        return [by_id[item] for item in ids if item in by_id]
+
+    async def attach_artifact(
+        self,
+        actor: Agent,
+        message_id: str,
+        *,
+        reference: str,
+        label: str = "",
+        mime_type: str = "application/octet-stream",
+    ) -> Artifact:
+        message = await self.db.get(Message, message_id)
+        if message is None:
+            raise NotFound(f"Unknown message {message_id}")
+        await self._require_member(actor, await self._room(message.room_id), allow_owner=True)
+        raw = reference.strip()
+        size = None
+        digest = ""
+        if raw.startswith("https://"):
+            kind = "url"
+        else:
+            kind = "workspace"
+            relative = raw.removeprefix("/workspace/").removeprefix("workspace/")
+            candidate = (self.workspace_dir / relative).resolve()
+            if not candidate.is_relative_to(self.workspace_dir) or not candidate.is_file():
+                raise TeamError("Artifact must be an existing file inside the workspace")
+            raw = relative
+            size = candidate.stat().st_size
+            digest = _hash_file(candidate)
+        artifact = Artifact(
+            message_id=message.id,
+            kind=kind,
+            reference=raw,
+            label=(label.strip() or Path(raw).name or "artifact")[:180],
+            mime_type=mime_type[:120],
+            size_bytes=size,
+            sha256=digest,
+            created_at=self.clock.now(),
+        )
+        self.db.add(artifact)
+        await self.db.flush()
+        await self.record(
+            "artifact",
+            f"Artifact {artifact.label}",
+            actor_id=actor.id,
+            room_id=message.room_id,
+            artifact_id=artifact.id,
+            sha256=digest,
+        )
+        return artifact
+
+    async def get_artifact(self, actor: Agent, artifact_id: str) -> Artifact:
+        artifact = await self.db.get(Artifact, artifact_id)
+        if artifact is None:
+            raise NotFound(f"Unknown artifact {artifact_id}")
+        message = await self.db.get(Message, artifact.message_id)
+        if message is None:
+            raise NotFound(f"Unknown artifact {artifact_id}")
+        await self._require_member(actor, await self._room(message.room_id), allow_owner=True)
+        return artifact
 
     async def set_message_reaction(
         self, actor: Agent, message_id: str, value: str
@@ -890,7 +1006,13 @@ class TeamService:
         match_any: list[str] | None = None,
         ignore_any: list[str] | None = None,
         context: dict | None = None,
+        max_runs: int | None = None,
+        expires_at=None,
     ) -> Routine:
+        if not source and interval_seconds <= 0:
+            raise TeamError("A routine needs an event source or positive interval")
+        if max_runs is not None and max_runs < 1:
+            raise TeamError("Routine max_runs must be positive")
         next_due = None
         if interval_seconds > 0:
             next_due = self.clock.now() + timedelta(seconds=interval_seconds)
@@ -902,8 +1024,12 @@ class TeamService:
             match_any_json=json.dumps(match_any or []),
             ignore_any_json=json.dumps(ignore_any or []),
             context_json=json.dumps(context or {}),
+            trigger_type="interval" if interval_seconds > 0 else "event",
+            max_runs=max_runs,
+            expires_at=expires_at,
             next_due_at=next_due,
             created_at=self.clock.now(),
+            updated_at=self.clock.now(),
         )
         self.db.add(routine)
         await self.db.flush()
@@ -911,23 +1037,174 @@ class TeamService:
         self.signal.notify()
         return routine
 
-    async def list_routines(self, agent_id: str | None = None) -> list[Routine]:
-        stmt = select(Routine).where(Routine.active == 1)
+    async def list_routines(
+        self, agent_id: str | None = None, *, include_inactive: bool = False
+    ) -> list[Routine]:
+        stmt = select(Routine)
+        stmt = stmt.where(Routine.retired_at.is_(None))
+        if not include_inactive:
+            stmt = stmt.where(Routine.active == 1)
         if agent_id:
             stmt = stmt.where(Routine.agent_id == agent_id)
-        return list((await self.db.execute(stmt)).scalars())
+        return list((await self.db.execute(stmt.order_by(Routine.created_at.desc()))).scalars())
+
+    async def update_routine(
+        self,
+        actor: Agent,
+        routine_id: str,
+        *,
+        active: bool | None = None,
+        reason: str | None = None,
+        match_any: list[str] | None = None,
+        ignore_any: list[str] | None = None,
+        expires_at=None,
+    ) -> Routine:
+        routine = await self.db.get(Routine, routine_id)
+        if routine is None or routine.agent_id != actor.id or routine.retired_at is not None:
+            raise NotFound(f"Unknown routine {routine_id}")
+        if active is not None:
+            routine.active = int(active)
+            if active and routine.interval_seconds and routine.next_due_at is None:
+                routine.next_due_at = self.clock.now() + timedelta(seconds=routine.interval_seconds)
+        if reason is not None:
+            routine.reason = reason.strip() or routine.reason
+        if match_any is not None:
+            routine.match_any_json = json.dumps(match_any)
+        if ignore_any is not None:
+            routine.ignore_any_json = json.dumps(ignore_any)
+        if expires_at is not None:
+            routine.expires_at = expires_at
+        routine.updated_at = self.clock.now()
+        await self.db.flush()
+        await self.record(
+            "routine.update",
+            f"Routine {routine.id} {'active' if routine.active else 'paused'}",
+            actor_id=actor.id,
+        )
+        self.signal.notify()
+        return routine
+
+    async def retire_routine(self, actor: Agent, routine_id: str) -> Routine:
+        routine = await self.db.get(Routine, routine_id)
+        if routine is None or routine.agent_id != actor.id or routine.retired_at is not None:
+            raise NotFound(f"Unknown routine {routine_id}")
+        routine.active = 0
+        routine.next_due_at = None
+        routine.retired_at = self.clock.now()
+        routine.updated_at = self.clock.now()
+        await self.db.flush()
+        await self.record("routine.retire", f"Retired routine {routine.id}", actor_id=actor.id)
+        return routine
+
+    async def run_routine(self, actor: Agent, routine_id: str) -> WakeEvent:
+        routine = await self.db.get(Routine, routine_id)
+        if routine is None or routine.agent_id != actor.id or routine.retired_at is not None:
+            raise NotFound(f"Unknown routine {routine_id}")
+        event = await self._fire_routine(routine, "manual", {"manual": True})
+        if event is None:
+            raise TeamError("Routine is expired or exhausted")
+        return event
+
+    async def routine_history(self, actor: Agent, routine_id: str) -> list[RoutineRun]:
+        routine = await self.db.get(Routine, routine_id)
+        if routine is None or routine.agent_id != actor.id:
+            raise NotFound(f"Unknown routine {routine_id}")
+        return list(
+            (
+                await self.db.execute(
+                    select(RoutineRun)
+                    .where(RoutineRun.routine_id == routine.id)
+                    .order_by(RoutineRun.created_at.desc())
+                    .limit(100)
+                )
+            ).scalars()
+        )
+
+    def _routine_available(self, routine: Routine) -> bool:
+        now = self.clock.now()
+        if routine.expires_at and routine.expires_at <= now:
+            routine.active = 0
+            return False
+        if routine.max_runs is not None and routine.run_count >= routine.max_runs:
+            routine.active = 0
+            return False
+        return bool(routine.active)
+
+    async def _fire_routine(
+        self,
+        routine: Routine,
+        trigger: str,
+        payload: dict,
+        verdict: str = "yes",
+        dedupe_key: str | None = None,
+    ) -> WakeEvent | None:
+        if not self._routine_available(routine):
+            return None
+        agent = await self.db.get(Agent, routine.agent_id)
+        if agent is None:
+            return None
+        event_key = dedupe_key or f"routine:{routine.id}:{trigger}:{_hash(payload)}"
+        existing = (
+            await self.db.execute(
+                select(WakeEvent).where(
+                    WakeEvent.dedupe_key == event_key,
+                    WakeEvent.status.in_(("pending", "claimed")),
+                )
+            )
+        ).scalar_one_or_none()
+        if existing:
+            return None
+        event = await self.enqueue_wake(
+            target=agent,
+            actor=None,
+            reason="routine" if trigger in {"interval", "manual"} else "webhook",
+            context_reference=routine.id,
+            payload={
+                "routine_id": routine.id,
+                "reason": routine.reason,
+                "source": routine.source,
+                "trigger": trigger,
+                **json.loads(routine.context_json or "{}"),
+                **payload,
+            },
+            dedupe_key=event_key,
+        )
+        if event:
+            routine.run_count += 1
+            routine.last_fired_at = self.clock.now()
+            routine.updated_at = self.clock.now()
+            self.db.add(
+                RoutineRun(
+                    routine_id=routine.id,
+                    wake_event_id=event.id,
+                    trigger=trigger,
+                    verdict=verdict,
+                    detail=json.dumps(payload, default=str)[:1000],
+                    created_at=self.clock.now(),
+                )
+            )
+            if routine.max_runs is not None and routine.run_count >= routine.max_runs:
+                routine.active = 0
+            await self.db.flush()
+        return event
 
     async def list_loops(self, agent_id: str) -> list[OpenLoop]:
         stmt = select(OpenLoop).where(OpenLoop.agent_id == agent_id, OpenLoop.status == "open")
         return list((await self.db.execute(stmt)).scalars())
 
     async def create_task(
-        self, actor: Agent, room_id: str, owner: str, objective: str
+        self,
+        actor: Agent,
+        room_id: str,
+        owner: str,
+        objective: str,
+        execution_lane: str = "shared",
     ) -> KanbanRef:
         room = await self._room(room_id)
         assignee = await self.get_agent(owner)
-        profile = assignee.hermes_profile or assignee.name
-        ticket = await self.kanban.create(objective, profile, objective)
+        # Moatbots' wake is the one execution owner. The Hermes card is kept
+        # unassigned so enabling a Kanban dispatcher cannot execute it again.
+        ticket = await self.kanban.create(objective, "", objective)
         ref = KanbanRef(
             room_id=room.id,
             hermes_task_id=ticket.id,
@@ -959,6 +1236,7 @@ class TeamService:
                 "objective": objective,
             },
             dedupe_key=f"task:{ticket.id}:{assignee.id}",
+            execution_lane=execution_lane,
         )
         return ref
 
@@ -1014,11 +1292,14 @@ class TeamService:
         due_at=None,
         dedupe_key: str | None = None,
         state_hash: str = "",
+        execution_lane: str = "shared",
     ) -> WakeEvent | None:
         if target.retired_at is not None:
             raise TeamError(f"@{target.name} is retired")
         when = due_at or self.clock.now()
         body = payload or {}
+        if execution_lane not in {"shared", "headless"}:
+            raise TeamError("Execution lane must be shared or headless")
         digest = state_hash or _hash(body)
         await self._reject_recursive_self_wake(actor, target, when, digest)
         if dedupe_key:
@@ -1042,6 +1323,7 @@ class TeamService:
             status="pending",
             payload_json=json.dumps(body, default=str),
             state_hash=digest,
+            execution_lane=execution_lane,
             created_at=self.clock.now(),
         )
         self.db.add(event)
@@ -1057,30 +1339,75 @@ class TeamService:
 
     async def claim_due_events(self, limit: int = 16) -> list[WakeEvent]:
         now = self.clock.now()
+        stale = list(
+            (
+                await self.db.execute(
+                    select(WakeEvent).where(
+                        WakeEvent.status == "claimed",
+                        WakeEvent.lease_expires_at.is_not(None),
+                        WakeEvent.lease_expires_at <= now,
+                    )
+                )
+            ).scalars()
+        )
+        for event in stale:
+            abandoned = None
+            if event.claimed_run_id:
+                abandoned = await self.db.get(Run, event.claimed_run_id)
+            if abandoned is None:
+                abandoned = (
+                    await self.db.execute(
+                        select(Run).where(Run.wake_event_id == event.id, Run.status == "running")
+                    )
+                ).scalar_one_or_none()
+            if abandoned and abandoned.status == "running":
+                abandoned.status = "error"
+                abandoned.decision = "lease_expired"
+                abandoned.note = "Dispatcher lease expired before completion"
+                abandoned.ended_at = now
+            event.status = "pending"
+            event.claimed_run_id = None
+            event.claimed_at = None
+            event.lease_expires_at = None
+            agent = await self.db.get(Agent, event.target_id)
+            if agent:
+                agent.status = "idle"
         rows = list(
             (
                 await self.db.execute(
                     select(WakeEvent)
                     .where(WakeEvent.status == "pending", WakeEvent.due_at <= now)
                     .order_by(WakeEvent.due_at.asc())
-                    .limit(limit)
+                    .limit(max(16, limit * 8))
                 )
             ).scalars()
         )
         claimed: list[WakeEvent] = []
         seen: set[str] = set()
+        seen_targets: set[str] = set()
+        claimed_shared = False
         for event in rows:
+            if len(claimed) >= limit:
+                break
             if event.dedupe_key and event.dedupe_key in seen:
                 event.status = "ignored"
                 continue
             if event.dedupe_key:
                 seen.add(event.dedupe_key)
+            if event.target_id in seen_targets:
+                continue
+            if event.execution_lane == "shared" and claimed_shared:
+                continue
             busy = await self._running_count(event.target_id)
-            if busy >= self.budgets.max_concurrency:
+            if busy:
                 continue
             event.status = "claimed"
             event.claimed_at = now
+            event.lease_expires_at = now + timedelta(seconds=self.budgets.wake_lease_seconds)
+            event.attempts += 1
             claimed.append(event)
+            seen_targets.add(event.target_id)
+            claimed_shared = claimed_shared or event.execution_lane == "shared"
         await self.db.flush()
         return claimed
 
@@ -1088,6 +1415,7 @@ class TeamService:
         self, event: WakeEvent, run: Run, decision: str, note: str = ""
     ) -> None:
         event.status = "done"
+        event.lease_expires_at = None
         run.status = "done"
         run.decision = decision
         run.note = note
@@ -1099,6 +1427,7 @@ class TeamService:
 
     async def ignore_event(self, event: WakeEvent, run: Run | None, note: str) -> None:
         event.status = "ignored"
+        event.lease_expires_at = None
         if run:
             run.status = "ignored"
             run.decision = "ignore"
@@ -1108,6 +1437,23 @@ class TeamService:
         if agent:
             agent.status = "idle"
         await self.db.flush()
+
+    async def release_claim(self, event: WakeEvent, note: str) -> None:
+        run = await self.db.get(Run, event.claimed_run_id) if event.claimed_run_id else None
+        if run and run.status == "running":
+            run.status = "cancelled"
+            run.decision = "cancelled"
+            run.note = note
+            run.ended_at = self.clock.now()
+        event.status = "pending"
+        event.claimed_at = None
+        event.claimed_run_id = None
+        event.lease_expires_at = None
+        agent = await self.db.get(Agent, event.target_id)
+        if agent:
+            agent.status = "idle"
+        await self.db.flush()
+        self.signal.notify()
 
     async def earliest_due(self):
         wake = (
@@ -1139,6 +1485,7 @@ class TeamService:
             started_at=self.clock.now(),
         )
         self.db.add(run)
+        await self.db.flush()
         event.claimed_run_id = run.id
         agent = await self.db.get(Agent, event.target_id)
         if agent:
@@ -1169,6 +1516,8 @@ class TeamService:
                 return []
         created: list[WakeEvent] = []
         for routine in matching:
+            if not self._routine_available(routine):
+                continue
             verdict = decide(
                 payload,
                 match_any=parse_list(routine.match_any_json),
@@ -1183,16 +1532,12 @@ class TeamService:
             )
             if verdict == "no":
                 continue
-            agent = await self.db.get(Agent, routine.agent_id)
-            if agent is None:
-                continue
-            event = await self.enqueue_wake(
-                target=agent,
-                actor=None,
-                reason="webhook",
-                context_reference=routine.id,
-                payload={"source": source, "verdict": verdict, "routine_id": routine.id, **payload},
-                dedupe_key=dedupe_key or f"hook:{source}:{routine.id}:{_hash(payload)}",
+            event = await self._fire_routine(
+                routine,
+                source,
+                payload,
+                verdict,
+                dedupe_key=(f"{dedupe_key}:{routine.id}" if dedupe_key else None),
             )
             if event:
                 created.append(event)
@@ -1202,26 +1547,15 @@ class TeamService:
         now = self.clock.now()
         count = 0
         for routine in await self.list_routines():
+            if not self._routine_available(routine):
+                continue
             if not routine.next_due_at or routine.next_due_at > now:
                 continue
-            agent = await self.db.get(Agent, routine.agent_id)
-            if agent is None:
-                continue
-            await self.enqueue_wake(
-                target=agent,
-                actor=agent,
-                reason="routine",
-                context_reference=routine.id,
-                payload={
-                    "routine_id": routine.id,
-                    "reason": routine.reason,
-                    "source": routine.source,
-                },
-                dedupe_key=f"routine:{routine.id}:{int(now.timestamp())}",
-                due_at=now,
-                state_hash=f"{routine.id}:{routine.next_due_at.isoformat()}",
+            await self._fire_routine(
+                routine,
+                "interval",
+                {"scheduled_for": routine.next_due_at.isoformat()},
             )
-            routine.last_fired_at = now
             if routine.interval_seconds:
                 routine.next_due_at = now + timedelta(seconds=routine.interval_seconds)
             count += 1
@@ -1343,7 +1677,173 @@ class TeamService:
                 for row in await self.list_tasks()
                 if row.owner_id == agent.id
             ],
+            "human_requests": [
+                {
+                    "id": row.id,
+                    "kind": row.kind,
+                    "prompt": row.prompt,
+                    "status": row.status,
+                }
+                for row in await self.list_human_requests(agent_id=agent.id)
+            ],
         }
+
+    async def create_human_request(
+        self,
+        actor: Agent,
+        *,
+        kind: str,
+        prompt: str,
+        options: list[str] | None = None,
+        room_id: str | None = None,
+        secret_name: str | None = None,
+        expires_at=None,
+    ) -> HumanRequest:
+        if kind not in {"choice", "approval", "handoff", "secret"}:
+            raise TeamError("Human request kind must be choice, approval, handoff, or secret")
+        clean_prompt = prompt.strip()
+        if not clean_prompt:
+            raise TeamError("Human request needs a prompt")
+        choices = [str(item).strip() for item in (options or []) if str(item).strip()]
+        if kind == "choice" and len(choices) < 2:
+            raise TeamError("Choice requests need at least two options")
+        if kind == "secret" and (
+            not secret_name or not re.fullmatch(r"[A-Z][A-Z0-9_]{1,79}", secret_name)
+        ):
+            raise TeamError("Secret requests need an uppercase environment variable name")
+        if room_id:
+            await self._require_member(actor, await self._room(room_id), allow_owner=True)
+        request = HumanRequest(
+            agent_id=actor.id,
+            room_id=room_id,
+            kind=kind,
+            prompt=clean_prompt,
+            options_json=json.dumps(choices),
+            secret_name=secret_name,
+            status="pending",
+            created_at=self.clock.now(),
+            expires_at=expires_at,
+        )
+        self.db.add(request)
+        await self.db.flush()
+        human = await self.get_agent("you")
+        dm = await self.get_or_create_dm(human, actor)
+        await self.send_message(
+            actor,
+            dm.id,
+            f"[request {request.id}] {clean_prompt}",
+            source_wake_event_id=None,
+        )
+        await self.record(
+            "human.request",
+            f"{actor.name} requested {kind}",
+            clean_prompt[:240],
+            actor_id=actor.id,
+            room_id=room_id,
+            request_id=request.id,
+        )
+        return request
+
+    async def list_human_requests(
+        self, *, agent_id: str | None = None, include_resolved: bool = False
+    ) -> list[HumanRequest]:
+        stmt = select(HumanRequest).options(selectinload(HumanRequest.agent))
+        if not include_resolved:
+            stmt = stmt.where(HumanRequest.status == "pending")
+        if agent_id:
+            stmt = stmt.where(HumanRequest.agent_id == agent_id)
+        return list(
+            (await self.db.execute(stmt.order_by(HumanRequest.created_at.desc()))).scalars()
+        )
+
+    async def resolve_human_request(
+        self, human: Agent, request_id: str, response: str
+    ) -> HumanRequest:
+        if human.kind != "human":
+            raise TeamError("Only the human can resolve a request")
+        request = await self.db.get(HumanRequest, request_id)
+        if request is None:
+            raise NotFound(f"Unknown request {request_id}")
+        if request.status != "pending":
+            raise TeamError("Request is already resolved")
+        if request.expires_at and request.expires_at <= self.clock.now():
+            request.status = "expired"
+            request.resolved_at = self.clock.now()
+            await self.db.flush()
+            raise TeamError("Request has expired")
+        value = response.strip()
+        payload: dict[str, Any]
+        if request.kind == "choice":
+            options = json.loads(request.options_json or "[]")
+            if value not in options:
+                raise TeamError("Response must be one of the offered choices")
+            payload = {"choice": value}
+        elif request.kind == "approval":
+            normalized = value.lower()
+            if normalized not in {"approve", "deny"}:
+                raise TeamError("Approval response must be approve or deny")
+            payload = {"approved": normalized == "approve"}
+        elif request.kind == "secret":
+            if not value:
+                raise TeamError("Secret cannot be empty")
+            agent = await self.get_agent(request.agent_id)
+            secret_file = self.agent_state_dir / agent.name / "secrets.env"
+            secret_file.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            upsert_env(secret_file, request.secret_name or "SECRET", value)
+            secret_file.chmod(0o600)
+            payload = {"stored": True, "name": request.secret_name}
+        else:
+            if not value:
+                raise TeamError("Handoff response cannot be empty")
+            payload = {"response": value}
+        request.status = "resolved"
+        request.response_json = json.dumps(payload)
+        request.resolved_at = self.clock.now()
+        agent = await self.get_agent(request.agent_id)
+        await self.enqueue_wake(
+            target=agent,
+            actor=human,
+            reason="human_response",
+            context_reference=request.id,
+            payload={"request_id": request.id, "kind": request.kind, **payload},
+            dedupe_key=f"human-response:{request.id}",
+        )
+        await self.record(
+            "human.resolve",
+            f"Resolved {request.id}",
+            actor_id=human.id,
+            room_id=request.room_id,
+            request_id=request.id,
+            request_kind=request.kind,
+        )
+        return request
+
+    async def verify_demonstration(
+        self, actor: Agent, demonstration_id: str, learned_reference: str, note: str
+    ) -> Demonstration:
+        row = await self.db.get(Demonstration, demonstration_id)
+        if row is None or row.agent_id != actor.id:
+            raise NotFound(f"Unknown demonstration {demonstration_id}")
+        if row.status != "learning":
+            raise TeamError("Demonstration is not awaiting verification")
+        reference = learned_reference.strip()
+        verification = note.strip()
+        if not reference or not verification:
+            raise TeamError("Verification needs the learned skill reference and observed result")
+        row.learned_reference = reference
+        row.verification_note = verification
+        row.status = "verified"
+        row.verified_at = self.clock.now()
+        await self.db.flush()
+        await self.record(
+            "demonstration.verified",
+            f"Verified {row.title}",
+            verification[:240],
+            actor_id=actor.id,
+            demonstration_id=row.id,
+            learned_reference=reference,
+        )
+        return row
 
     async def list_activity(self, limit: int = 80) -> list[Activity]:
         stmt = select(Activity).order_by(Activity.created_at.desc()).limit(limit)
@@ -1739,6 +2239,14 @@ class TeamService:
 def _hash(payload: object) -> str:
     blob = json.dumps(payload, default=str, sort_keys=True)
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16]
+
+
+def _hash_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _capabilities(role_title: str, job_description: str) -> list[str]:

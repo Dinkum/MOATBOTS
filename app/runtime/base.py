@@ -10,7 +10,10 @@ from app.services.team import TeamService
 class RuntimeResult:
     decision: str
     note: str = ""
-    turns: int = 1
+    turns: int | None = None
+    cost_usd: float | None = None
+    provider: str = ""
+    model: str = ""
 
 
 class Runtime:

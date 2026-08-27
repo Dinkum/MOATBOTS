@@ -143,6 +143,12 @@ case "${1:-status}" in
       --env "MOATBOTS_AGENT_TOKEN=$(setting token "$actor")"
       --env XDG_CACHE_HOME=/config/.cache
     )
+    if [[ -f "$auth_root/.env" ]]; then
+      exec_args+=(--env-file "$auth_root/.env")
+    fi
+    if [[ -f "$local_home/secrets.env" ]]; then
+      exec_args+=(--env-file "$local_home/secrets.env")
+    fi
     for name in MOATBOTS_RUN_ID OPENROUTER_API_KEY XAI_API_KEY; do
       if [[ -n "${!name:-}" ]]; then
         exec_args+=(--env "$name=${!name}")

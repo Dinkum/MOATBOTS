@@ -66,8 +66,9 @@ class AuthSnapshot:
 class AuthService:
     """Three ways onto a model: Grok Build browser session, Codex browser session, OpenRouter key.
 
-    We do not store tokens. We read the stores Hermes and Grok Build already use,
-    and we pass the matching --provider when a profile is woken.
+    We do not store browser tokens. Automatic profiles let Hermes own provider
+    routing and fallback. Explicit per-agent overrides use this service to pass
+    the matching provider and model.
     """
 
     def __init__(self, settings: Settings) -> None:

@@ -1,8 +1,9 @@
 [project]
 name = "moatbots"
-version = "0.1.0"
+version = "0.1.1"
 description = "Team runtime around Hermes: persistent rooms, coordination, and event-driven wakes"
 readme = "README.md"
+license = "MIT"
 requires-python = ">=3.11,<3.15"
 dependencies = [
   "aiosqlite==0.21.0",

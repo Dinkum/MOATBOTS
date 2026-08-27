@@ -73,6 +73,8 @@ def test_shared_computer_mounts_work_surfaces_without_control_plane_state():
     assert "dst=/agents" in computer
     assert "dst=/agent/shared" in computer
     assert "dst=/workspace" in computer
+    assert '--env-file "$auth_root/.env"' in computer
+    assert '--env-file "$local_home/secrets.env"' in computer
     assert '--publish "$desktop_host:$desktop_port:3000"' in computer
     assert "src=$root/data" not in computer
     assert "src=$root/.env" not in computer

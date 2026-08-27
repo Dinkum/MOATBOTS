@@ -109,6 +109,9 @@ class Message(Base):
     reactions: Mapped[list["MessageReaction"]] = relationship(
         back_populates="message", cascade="all, delete-orphan"
     )
+    artifacts: Mapped[list["Artifact"]] = relationship(
+        back_populates="message", cascade="all, delete-orphan"
+    )
     parent: Mapped["Message | None"] = relationship(
         remote_side=[id], foreign_keys=[parent_message_id], back_populates="replies"
     )
@@ -189,7 +192,12 @@ class WakeEvent(Base):
     status: Mapped[str] = mapped_column(String(16), default="pending")
     payload_json: Mapped[str] = mapped_column(Text, default="{}")
     state_hash: Mapped[str] = mapped_column(String(64), default="")
+    execution_lane: Mapped[str] = mapped_column(String(16), default="shared")
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
     claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, index=True
+    )
     claimed_run_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
 
@@ -207,10 +215,91 @@ class Routine(Base):
     context_json: Mapped[str] = mapped_column(Text, default="{}")
     match_any_json: Mapped[str] = mapped_column(Text, default="[]")
     ignore_any_json: Mapped[str] = mapped_column(Text, default="[]")
+    trigger_type: Mapped[str] = mapped_column(String(16), default="event")
+    max_runs: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    run_count: Mapped[int] = mapped_column(Integer, default=0)
     active: Mapped[int] = mapped_column(Integer, default=1)
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     last_fired_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     next_due_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    retired_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    agent: Mapped[Agent] = relationship()
+
+
+class RoutineRun(Base):
+    __tablename__ = "routine_run"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=lambda: new_id("rrun"))
+    routine_id: Mapped[str] = mapped_column(
+        ForeignKey("routine.id", ondelete="CASCADE"), index=True
+    )
+    wake_event_id: Mapped[str | None] = mapped_column(
+        ForeignKey("wake_event.id", ondelete="SET NULL"), nullable=True
+    )
+    trigger: Mapped[str] = mapped_column(String(32))
+    verdict: Mapped[str] = mapped_column(String(16), default="yes")
+    detail: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+    routine: Mapped[Routine] = relationship()
+
+
+class Artifact(Base):
+    __tablename__ = "artifact"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=lambda: new_id("art"))
+    message_id: Mapped[str] = mapped_column(
+        ForeignKey("message.id", ondelete="CASCADE"), index=True
+    )
+    kind: Mapped[str] = mapped_column(String(16))  # workspace | url
+    reference: Mapped[str] = mapped_column(Text)
+    label: Mapped[str] = mapped_column(String(180), default="")
+    mime_type: Mapped[str] = mapped_column(String(120), default="application/octet-stream")
+    size_bytes: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    sha256: Mapped[str] = mapped_column(String(64), default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+    message: Mapped[Message] = relationship(back_populates="artifacts")
+
+
+class HumanRequest(Base):
+    __tablename__ = "human_request"
+    __table_args__ = (Index("ix_human_request_queue", "status", "created_at"),)
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=lambda: new_id("hrq"))
+    agent_id: Mapped[str] = mapped_column(ForeignKey("agent.id"), index=True)
+    room_id: Mapped[str | None] = mapped_column(ForeignKey("room.id"), nullable=True)
+    kind: Mapped[str] = mapped_column(String(16))  # choice | approval | handoff | secret
+    prompt: Mapped[str] = mapped_column(Text)
+    options_json: Mapped[str] = mapped_column(Text, default="[]")
+    secret_name: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    status: Mapped[str] = mapped_column(String(16), default="pending")
+    response_json: Mapped[str] = mapped_column(Text, default="{}")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    agent: Mapped[Agent] = relationship()
+    room: Mapped[Room | None] = relationship()
+
+
+class Demonstration(Base):
+    __tablename__ = "demonstration"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=lambda: new_id("demo"))
+    agent_id: Mapped[str] = mapped_column(ForeignKey("agent.id"), index=True)
+    title: Mapped[str] = mapped_column(String(180))
+    status: Mapped[str] = mapped_column(String(24), default="recording")
+    recording_path: Mapped[str] = mapped_column(Text)
+    sha256: Mapped[str] = mapped_column(String(64), default="")
+    learned_reference: Mapped[str] = mapped_column(Text, default="")
+    verification_note: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    stopped_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     agent: Mapped[Agent] = relationship()
 
@@ -255,9 +344,11 @@ class Run(Base):
     status: Mapped[str] = mapped_column(String(16), default="running")
     decision: Mapped[str] = mapped_column(String(32), default="")
     note: Mapped[str] = mapped_column(Text, default="")
-    turns_used: Mapped[int] = mapped_column(Integer, default=0)
+    turns_used: Mapped[int | None] = mapped_column(Integer, nullable=True)
     handoffs_used: Mapped[int] = mapped_column(Integer, default=0)
-    cost_usd: Mapped[float] = mapped_column(Float, default=0.0)
+    cost_usd: Mapped[float | None] = mapped_column(Float, nullable=True)
+    provider: Mapped[str] = mapped_column(String(80), default="")
+    model: Mapped[str] = mapped_column(String(160), default="")
     max_turns: Mapped[int] = mapped_column(Integer, default=24)
     max_handoffs: Mapped[int] = mapped_column(Integer, default=6)
     started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)

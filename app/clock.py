@@ -1,6 +1,13 @@
 from datetime import UTC, datetime, timedelta
 
 
+def utc_iso(value: datetime) -> str:
+    """Serialize SQLite's naive UTC values unambiguously for browser-local display."""
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=UTC)
+    return value.astimezone(UTC).isoformat().replace("+00:00", "Z")
+
+
 class Clock:
     def now(self) -> datetime:
         return datetime.now(UTC)
