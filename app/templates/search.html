@@ -1,13 +1,28 @@
 {% extends "base.html" %}
 {% block title %}search · Moatbots{% endblock %}
 {% block content %}
-<form class="inline-search" method="get" action="/search">
-  <input name="q" value="{{ query }}" placeholder="search conversations" aria-label="search conversations" autofocus>
+<form class="result-search" method="get" action="/search">
+  {% if search_room_id %}<input type="hidden" name="room_id" value="{{ search_room_id }}">{% endif %}
+  <input name="q" value="{{ query }}" placeholder="search" aria-label="search" autofocus>
+  <select name="kind" aria-label="search in"><option value="messages"{% if search_kind == 'messages' %} selected{% endif %}>messages</option><option value="files"{% if search_kind == 'files' %} selected{% endif %}>files</option></select>
+  <button>search</button>
 </form>
-{% if query %}
+{% if search_room_id %}<p class="dim">this conversation · <a href="/search?kind={{ search_kind }}">all conversations</a></p>{% endif %}
+{% if search_kind == 'files' %}
+  <p class="dim">{{ artifacts|length }} file{% if artifacts|length != 1 %}s{% endif %}{% if artifacts|length == 100 %} · latest 100{% endif %}</p>
+  {% for artifact in artifacts %}
+  <div class="search-result">
+    <a href="/artifacts/{{ artifact.id }}">{{ artifact.label }}</a>
+    <small>{{ 'link' if artifact.kind == 'url' else 'file' }}{% if artifact.size_bytes is not none %} · {{ artifact.size_bytes|filesizeformat }}{% endif %}</small>
+    <p class="dim">{{ artifact.message.sender.name }} · <a href="/rooms/{{ artifact.message.room_id }}?message={{ artifact.message_id }}#message-{{ artifact.message_id }}">view message</a></p>
+  </div>
+  {% endfor %}
+{% elif query %}
   <p class="dim">{{ messages|length }} result{% if messages|length != 1 %}s{% endif %}</p>
   {% for message in messages %}
-  <p class="search-result"><a href="/rooms/{{ message.room_id }}">{{ rooms[message.room_id].title }}</a> <span class="who">{{ message.sender.name }}</span> {{ message.body }}</p>
+  <div class="search-result"><a href="/rooms/{{ message.room_id }}?message={{ message.id }}#message-{{ message.id }}">{{ rooms[message.room_id].title }}</a> <span class="who">{{ message.sender.name }}</span> {{ message.body }}
+    {% if message.artifacts %}<div class="message-artifacts">{% for artifact in message.artifacts %}<a href="/artifacts/{{ artifact.id }}">[{{ artifact.label }}]</a>{% endfor %}</div>{% endif %}
+  </div>
   {% endfor %}
 {% endif %}
 {% endblock %}

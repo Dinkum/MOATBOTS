@@ -4,6 +4,7 @@ import json
 import httpx
 import pytest
 
+from app.services.outbox import PortalOutbox
 from app.services.portal import ManagedPortal, Portal, TelegramPortal
 from tests.conftest import open_team
 
@@ -28,7 +29,7 @@ class ListeningPortal(Portal):
         self.closed = True
 
 
-async def ignore_text(_text: str) -> None:
+async def ignore_text(_text: str, _delivery_id: str) -> None:
     return None
 
 
@@ -41,9 +42,12 @@ async def test_agent_dm_reaches_portal_human_does_not(world):
         await team.send_message(you, dm.id, "hi")
         assert world["portal"].sent == []
         await team.send_message(chief, dm.id, "billing is down")
-        assert world["portal"].sent == [
-            {"sender": "chief", "body": "billing is down", "room_title": dm.title}
-        ]
+        assert world["portal"].sent == []
+    worker = PortalOutbox(world["factory"], world["clock"], world["portal"])
+    assert await worker.drain() == 1
+    assert world["portal"].sent == [
+        {"sender": "chief", "body": "billing is down", "room_title": dm.title}
+    ]
 
 
 @pytest.mark.asyncio
@@ -119,7 +123,7 @@ async def test_telegram_http_error_backs_off_without_leaking_token(monkeypatch):
         assert delay == 2
         portal.stop()
 
-    monkeypatch.setattr("app.services.portal.asyncio.sleep", stop_after_backoff)
+    monkeypatch.setattr(portal, "_pause", stop_after_backoff)
     monkeypatch.setattr("app.services.portal.emit", lambda *args, **_kwargs: logs.append(args))
 
     await portal.listen(ignore_text)
@@ -136,7 +140,8 @@ async def test_telegram_accepts_only_the_bound_human_chat():
     client = httpx.AsyncClient(transport=httpx.MockTransport(lambda _request: None))
     portal = TelegramPortal("secret-token", chat_id="42", client=client)
 
-    async def receive(text: str) -> None:
+    async def receive(text: str, delivery_id: str) -> None:
+        assert delivery_id.startswith("telegram:")
         received.append(text)
 
     await portal._take({"message": {"chat": {"id": 41}, "from": {}, "text": "wrong chat"}}, receive)
@@ -145,7 +150,7 @@ async def test_telegram_accepts_only_the_bound_human_chat():
         receive,
     )
     await portal._take(
-        {"message": {"chat": {"id": 42}, "from": {}, "text": "@chief inspect"}},
+        {"update_id": 1, "message": {"chat": {"id": 42}, "from": {}, "text": "@chief inspect"}},
         receive,
     )
     await portal.close()

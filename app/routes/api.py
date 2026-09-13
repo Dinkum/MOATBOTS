@@ -172,7 +172,7 @@ async def room_messages(room_id: str, request: Request, team: TeamService = Depe
         viewer = await team.get_agent(handle)
     except NotFound:
         viewer = await team.get_agent("you")
-    messages = await team.history(room_id, viewer=viewer)
+    messages = await team.history(room_id, viewer=viewer, include_thread_roots=True)
     return serialize_messages(messages, viewer.id)
 
 

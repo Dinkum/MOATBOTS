@@ -1,6 +1,6 @@
 [project]
 name = "moatbots"
-version = "0.1.1"
+version = "0.1.2"
 description = "Team runtime around Hermes: persistent rooms, coordination, and event-driven wakes"
 readme = "README.md"
 license = "MIT"

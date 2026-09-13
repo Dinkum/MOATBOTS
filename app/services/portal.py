@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import re
 from collections.abc import Awaitable, Callable
@@ -15,14 +16,36 @@ from app.logger import emit
 from app.services.auth import upsert_env
 
 TELEGRAM_API = "https://api.telegram.org"
-OnText = Callable[[str], Awaitable[None]]
+OnText = Callable[[str, str], Awaitable[None]]
 _NAME = re.compile(r"^@?([A-Za-z0-9_-]+)[:\s]+(.*)$", re.S)
+
+
+class PortalDeliveryError(Exception):
+    def __init__(self, detail: str, *, retryable: bool = True, retry_after: int = 0) -> None:
+        super().__init__(detail)
+        self.retryable = retryable
+        self.retry_after = retry_after
 
 
 class Portal:
     """One pipe to the human. Rooms stay the record."""
 
     kind = "none"
+
+    @property
+    def adapter(self) -> Portal:
+        return self
+
+    @property
+    def delivery_key(self) -> str:
+        return self.kind
+
+    @property
+    def recipient(self) -> str:
+        return self.kind if self.kind != "none" else ""
+
+    def parts(self, sender: str, body: str) -> list[str]:
+        return [body]
 
     async def push(self, *, sender: str, body: str, room_title: str) -> None:
         return None
@@ -64,6 +87,18 @@ class ManagedPortal(Portal):
         return self._portal.kind
 
     @property
+    def adapter(self) -> Portal:
+        return self._portal
+
+    @property
+    def delivery_key(self) -> str:
+        return self._portal.delivery_key
+
+    @property
+    def recipient(self) -> str:
+        return self._portal.recipient
+
+    @property
     def last_peer(self) -> str:
         return getattr(self._portal, "last_peer", "chief")
 
@@ -100,7 +135,10 @@ class ManagedPortal(Portal):
             return
         self._listener.cancel()
         with suppress(asyncio.CancelledError):
-            await self._listener
+            try:
+                await self._listener
+            except Exception as exc:
+                emit("portal", "listener.error", f"Listener stopped: {type(exc).__name__}")
         self._listener = None
 
 
@@ -116,8 +154,35 @@ class TelegramPortal(Portal):
         self.token = token
         self.chat_id = chat_id or ""
         self.last_peer = "chief"
+        self.last_error = ""
         self._stop = asyncio.Event()
         self._client = client or httpx.AsyncClient(timeout=40.0)
+
+    @property
+    def delivery_key(self) -> str:
+        # Bind queued work to its configured bot without persisting the credential.
+        return "telegram:" + hashlib.sha256(self.token.encode()).hexdigest()
+
+    @property
+    def recipient(self) -> str:
+        return str(self.chat_id)
+
+    def parts(self, sender: str, body: str) -> list[str]:
+        # Telegram counts UTF-16 units. Keep every chunk, including its sender, in bounds.
+        available = 4096 - len(f"{sender}: ".encode("utf-16-le")) // 2
+        chunks: list[str] = []
+        current: list[str] = []
+        used = 0
+        for character in body:
+            width = 2 if ord(character) > 0xFFFF else 1
+            if used + width > available:
+                chunks.append("".join(current))
+                current, used = [], 0
+            current.append(character)
+            used += width
+        if current:
+            chunks.append("".join(current))
+        return chunks
 
     def stop(self) -> None:
         self._stop.set()
@@ -128,8 +193,7 @@ class TelegramPortal(Portal):
 
     async def push(self, *, sender: str, body: str, room_title: str) -> None:
         if not self.chat_id:
-            emit("portal", "telegram.skip", "no chat_id")
-            return
+            raise PortalDeliveryError("Telegram chat is not bound")
         self.last_peer = sender
         await self._post(
             "sendMessage",
@@ -150,12 +214,31 @@ class TelegramPortal(Portal):
                     },
                 )
             except (httpx.HTTPError, ValueError) as exc:
-                emit("portal", "telegram.poll", _error_detail(exc))
-                await asyncio.sleep(2)
+                self.last_error = _error_detail(exc)
+                emit("portal", "telegram.poll", self.last_error)
+                await self._pause(2)
                 continue
+            self.last_error = ""
             for update in data.get("result") or []:
-                offset = int(update.get("update_id", 0)) + 1
-                await self._take(update, on_text)
+                failures = 0
+                while not self._stop.is_set():
+                    try:
+                        await self._take(update, on_text)
+                    except Exception as exc:
+                        # Keep the failed update unacknowledged. The callback's durable
+                        # receipt makes a retry safe even after an uncertain commit.
+                        failures += 1
+                        self.last_error = f"Telegram ingestion failed: {type(exc).__name__}"
+                        emit("portal", "telegram.ingest", self.last_error)
+                        await self._pause(min(30, 2 ** min(failures, 5)))
+                    else:
+                        offset = int(update["update_id"]) + 1
+                        self.last_error = ""
+                        break
+
+    async def _pause(self, seconds: float) -> None:
+        with suppress(TimeoutError):
+            await asyncio.wait_for(self._stop.wait(), timeout=seconds)
 
     async def _take(self, update: dict, on_text: OnText) -> None:
         message = update.get("message") or {}
@@ -184,21 +267,48 @@ class TelegramPortal(Portal):
                 {"chat_id": chat_id, "text": "office is up. @name then the message."},
             )
             return
-        await on_text(text)
+        await on_text(text, f"{self.delivery_key}:{update['update_id']}")
 
     async def _get(self, method: str, params: dict) -> dict:
         url = f"{TELEGRAM_API}/bot{self.token}/{method}"
         response = await self._client.get(url, params=params)
         response.raise_for_status()
-        return response.json()
+        data = response.json()
+        if not isinstance(data, dict) or data.get("ok") is not True:
+            raise ValueError("Invalid Telegram response")
+        updates = data.get("result")
+        if not isinstance(updates, list) or any(
+            not isinstance(row, dict) or not isinstance(row.get("update_id"), int)
+            for row in updates
+        ):
+            raise ValueError("Invalid Telegram updates")
+        return data
 
     async def _post(self, method: str, payload: dict) -> None:
         url = f"{TELEGRAM_API}/bot{self.token}/{method}"
         try:
             response = await self._client.post(url, json=payload, timeout=12.0)
-            response.raise_for_status()
         except httpx.HTTPError as exc:
-            emit("portal", "telegram.fail", _error_detail(exc))
+            raise PortalDeliveryError(_error_detail(exc)) from None
+        try:
+            data = response.json()
+        except ValueError:
+            data = {}
+        if response.is_success and isinstance(data, dict) and data.get("ok") is True:
+            return
+        code = data.get("error_code", response.status_code) if isinstance(data, dict) else 502
+        if not isinstance(code, int):
+            code = response.status_code
+        retry_after = 0
+        if isinstance(data, dict):
+            parameters = data.get("parameters") or {}
+            if isinstance(parameters, dict) and isinstance(parameters.get("retry_after"), int):
+                retry_after = max(0, parameters["retry_after"])
+        raise PortalDeliveryError(
+            f"Telegram rejected delivery (status {code})",
+            retryable=code == 429 or code >= 500 or response.is_success,
+            retry_after=retry_after,
+        )
 
 
 def _error_detail(exc: Exception) -> str:

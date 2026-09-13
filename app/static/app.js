@@ -184,6 +184,7 @@
     const body = document.createElement("span");
     const menu = document.createElement("div");
     item.className = reply ? "msg thread-reply" : "msg";
+    item.id = `message-${message.id}`;
     item.dataset.messageId = message.id;
     row.className = "message-row";
     line.className = "message-line";
@@ -259,16 +260,32 @@
     if (!event.target.closest(".msg")) closeReactionMenus();
   });
 
-  if (window.location.hash.startsWith("#thread-")) {
-    const panel = document.querySelector(window.location.hash);
+  const revealAnchor = () => {
+    const target = document.getElementById(window.location.hash.slice(1));
+    if (!target) return false;
+    const panel = target.matches(".thread-panel") ? target : target.closest(".thread-panel");
     if (panel?.matches(".thread-panel")) {
       panel.hidden = false;
       const toggle = panel.parentElement.querySelector(":scope > .message-row [data-thread-toggle]");
       if (toggle) toggle.ariaExpanded = "true";
     }
-  } else {
+    requestAnimationFrame(() => target.scrollIntoView({ block: "center" }));
+    return true;
+  };
+  window.addEventListener("hashchange", revealAnchor);
+  if (!revealAnchor()) {
     requestAnimationFrame(scrollToLatest);
   }
+
+  const insertMessage = (container, item, message) => {
+    const at = new Date(message.at).valueOf();
+    const next = [...container.querySelectorAll(":scope > .msg")].find((node) => {
+      const time = node.querySelector(":scope > .message-row time");
+      const otherAt = new Date(time.dateTime).valueOf();
+      return otherAt > at || (otherAt === at && node.dataset.messageId > message.id);
+    });
+    container.insertBefore(item, next || null);
+  };
 
   window.setInterval(async () => {
     try {
@@ -279,7 +296,12 @@
       const known = new Map(
         [...room.querySelectorAll("[data-message-id]")].map((node) => [node.dataset.messageId, node]),
       );
-      payload.messages.forEach((message) => {
+      // A fetched parent can share a timestamp with its reply. Mount roots first.
+      const ordered = [
+        ...payload.messages.filter((message) => !message.parent_message_id),
+        ...payload.messages.filter((message) => message.parent_message_id),
+      ];
+      ordered.forEach((message) => {
         const item = known.get(message.id);
         if (item) {
           syncReactions(item, message.reactions);
@@ -291,7 +313,7 @@
           if (!root) return;
           const reply = render(message, true);
           const replies = root.querySelector(":scope > .thread-panel .thread-replies");
-          replies.append(reply);
+          insertMessage(replies, reply, message);
           formatMessageTimes(reply);
           syncDayDividers(replies);
           known.set(message.id, reply);
@@ -299,7 +321,7 @@
           return;
         }
         const root = render(message);
-        room.append(root);
+        insertMessage(room, root, message);
         formatMessageTimes(root);
         syncDayDividers(room);
         known.set(message.id, root);

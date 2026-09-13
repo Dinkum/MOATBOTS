@@ -3,12 +3,12 @@
 {% block heading %}settings{% endblock %}
 {% block content %}
 <p>inference · {% if auth.method(auth.selected).ready %}{{ auth.selected }}{% else %}not configured{% endif %}</p>
-<table>
+<table class="provider-settings">
   {% for method in [auth.grok_build, auth.codex, auth.openrouter] %}
   <tr>
     <td>{{ method.label }}</td>
     <td class="dim">{% if method.hermes_ready %}ready{% elif method.signed_in %}signed in{% else %}—{% endif %}</td>
-    <td class="dim">{{ method.account }}</td>
+    <td class="dim provider-account">{{ method.account }}</td>
     <td>
       {% if method.kind == 'browser' %}
       <form method="post" action="/settings/login/{{ method.id }}"><button>login</button></form>
@@ -24,16 +24,20 @@
   <button>save</button>
 </form>
 <hr>
-<p>portal · {{ portal_kind }}{% if portal_ready %} ready{% endif %}</p>
+<p>portal{% if portal_waiting %} · waiting for your first message{% endif %}</p>
 <form method="post" action="/settings/portal">
+  <label>delivery
+    <select name="kind"><option value="none"{% if portal_kind == 'none' %} selected{% endif %}>off</option><option value="telegram"{% if portal_kind == 'telegram' %} selected{% endif %}>Telegram</option></select>
+  </label>
   <label>telegram bot token
-    <input type="password" name="token" autocomplete="off">
+    <input type="password" name="token" autocomplete="off" placeholder="blank keeps saved token">
   </label>
   <label>telegram chat id
     <input name="chat_id" value="{{ telegram_chat_id }}" autocomplete="off">
   </label>
   <button>save</button>
+  {% if portal_error %}<p role="alert">{{ portal_error }}</p>{% endif %}
 </form>
-<p class="dim">set portal.kind: telegram in config.yaml. one office bot. rooms stay the record.</p>
+<p class="dim">No chat id? Save, then message your bot to connect.</p>
 <p><a href="/activity">activity log</a></p>
 {% endblock %}

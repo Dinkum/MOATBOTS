@@ -11,13 +11,34 @@ from sqlalchemy import (
     UniqueConstraint,
     text,
 )
+from sqlalchemy.engine import Dialect
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
+from sqlalchemy.types import TypeDecorator
 
 from app.ids import new_id
 
 
 def utc_now() -> datetime:
     return datetime.now(UTC)
+
+
+class UTCDateTime(TypeDecorator[datetime]):
+    """Keep SQLite's UTC storage format and restore awareness on every ORM read."""
+
+    impl = DateTime
+    cache_ok = True
+
+    def process_bind_param(self, value: datetime | None, dialect: Dialect) -> datetime | None:
+        if value is None:
+            return None
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=UTC)
+        return value.astimezone(UTC).replace(tzinfo=None)
+
+    def process_result_value(self, value: datetime | None, dialect: Dialect) -> datetime | None:
+        if value is None:
+            return None
+        return value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)
 
 
 class Base(DeclarativeBase):
@@ -37,8 +58,8 @@ class Agent(Base):
     reports_to_id: Mapped[str | None] = mapped_column(ForeignKey("agent.id"), nullable=True)
     capabilities_json: Mapped[str] = mapped_column(Text, default="[]")
     status: Mapped[str] = mapped_column(String(16), default="idle")  # idle | running
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
-    retired_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utc_now)
+    retired_at: Mapped[datetime | None] = mapped_column(UTCDateTime(), nullable=True)
 
     memberships: Mapped[list["Membership"]] = relationship(back_populates="agent")
     manager: Mapped["Agent | None"] = relationship(
@@ -59,8 +80,8 @@ class Room(Base):
     owner_id: Mapped[str | None] = mapped_column(ForeignKey("agent.id"), nullable=True)
     lifecycle: Mapped[str] = mapped_column(String(16), default="open", index=True)
     resolved_result: Mapped[str | None] = mapped_column(Text, nullable=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
-    archived_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utc_now)
+    archived_at: Mapped[datetime | None] = mapped_column(UTCDateTime(), nullable=True)
 
     owner: Mapped[Agent | None] = relationship()
     memberships: Mapped[list["Membership"]] = relationship(
@@ -102,7 +123,7 @@ class Message(Base):
     )
     body: Mapped[str] = mapped_column(Text)
     mentions_json: Mapped[str] = mapped_column(Text, default="[]")
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utc_now)
 
     room: Mapped[Room] = relationship(back_populates="messages")
     sender: Mapped[Agent] = relationship()
@@ -133,9 +154,9 @@ class Notification(Base):
     message_id: Mapped[str] = mapped_column(ForeignKey("message.id", ondelete="CASCADE"))
     kind: Mapped[str] = mapped_column(String(16))  # dm | group | mention | channel | thread
     wake_event_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
-    delivered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    read_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utc_now)
+    delivered_at: Mapped[datetime | None] = mapped_column(UTCDateTime(), nullable=True)
+    read_at: Mapped[datetime | None] = mapped_column(UTCDateTime(), nullable=True)
 
     agent: Mapped[Agent] = relationship()
     room: Mapped[Room] = relationship()
@@ -150,10 +171,39 @@ class MessageReaction(Base):
     message_id: Mapped[str] = mapped_column(ForeignKey("message.id", ondelete="CASCADE"))
     agent_id: Mapped[str] = mapped_column(ForeignKey("agent.id", ondelete="CASCADE"))
     value: Mapped[str] = mapped_column(String(8))  # up | down
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utc_now)
 
     message: Mapped[Message] = relationship(back_populates="reactions")
     agent: Mapped[Agent] = relationship()
+
+
+class PortalDelivery(Base):
+    __tablename__ = "portal_delivery"
+    __table_args__ = (Index("ix_portal_delivery_due", "status", "portal_key", "next_attempt_at"),)
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=lambda: new_id("pd"))
+    message_id: Mapped[str] = mapped_column(
+        ForeignKey("message.id", ondelete="CASCADE"), unique=True
+    )
+    portal_key: Mapped[str] = mapped_column(String(80))
+    recipient: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    status: Mapped[str] = mapped_column(String(16), default="pending")  # pending | sent | failed
+    next_part: Mapped[int] = mapped_column(Integer, default=0)
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    next_attempt_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utc_now)
+    last_error: Mapped[str] = mapped_column(String(240), default="")
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utc_now)
+    sent_at: Mapped[datetime | None] = mapped_column(UTCDateTime(), nullable=True)
+
+    message: Mapped[Message] = relationship()
+
+
+class PortalReceipt(Base):
+    __tablename__ = "portal_receipt"
+
+    id: Mapped[str] = mapped_column(String(160), primary_key=True)
+    peer: Mapped[str] = mapped_column(String(80))
+    received_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utc_now)
 
 
 class RoomRead(Base):
@@ -187,19 +237,19 @@ class WakeEvent(Base):
     actor_id: Mapped[str | None] = mapped_column(ForeignKey("agent.id"), nullable=True)
     reason: Mapped[str] = mapped_column(String(32), index=True)
     context_reference: Mapped[str] = mapped_column(String(80), default="")
-    due_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    due_at: Mapped[datetime] = mapped_column(UTCDateTime(), index=True)
     dedupe_key: Mapped[str | None] = mapped_column(String(160), nullable=True)
     status: Mapped[str] = mapped_column(String(16), default="pending")
     payload_json: Mapped[str] = mapped_column(Text, default="{}")
     state_hash: Mapped[str] = mapped_column(String(64), default="")
     execution_lane: Mapped[str] = mapped_column(String(16), default="shared")
     attempts: Mapped[int] = mapped_column(Integer, default=0)
-    claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    claimed_at: Mapped[datetime | None] = mapped_column(UTCDateTime(), nullable=True)
     lease_expires_at: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True), nullable=True, index=True
+        UTCDateTime(), nullable=True, index=True
     )
     claimed_run_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utc_now)
 
     target: Mapped[Agent] = relationship(foreign_keys=[target_id])
 
@@ -219,12 +269,12 @@ class Routine(Base):
     max_runs: Mapped[int | None] = mapped_column(Integer, nullable=True)
     run_count: Mapped[int] = mapped_column(Integer, default=0)
     active: Mapped[int] = mapped_column(Integer, default=1)
-    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    last_fired_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    next_due_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
-    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
-    retired_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    expires_at: Mapped[datetime | None] = mapped_column(UTCDateTime(), nullable=True)
+    last_fired_at: Mapped[datetime | None] = mapped_column(UTCDateTime(), nullable=True)
+    next_due_at: Mapped[datetime | None] = mapped_column(UTCDateTime(), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utc_now)
+    updated_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utc_now)
+    retired_at: Mapped[datetime | None] = mapped_column(UTCDateTime(), nullable=True)
 
     agent: Mapped[Agent] = relationship()
 
@@ -242,7 +292,7 @@ class RoutineRun(Base):
     trigger: Mapped[str] = mapped_column(String(32))
     verdict: Mapped[str] = mapped_column(String(16), default="yes")
     detail: Mapped[str] = mapped_column(Text, default="")
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utc_now)
 
     routine: Mapped[Routine] = relationship()
 
@@ -260,7 +310,7 @@ class Artifact(Base):
     mime_type: Mapped[str] = mapped_column(String(120), default="application/octet-stream")
     size_bytes: Mapped[int | None] = mapped_column(Integer, nullable=True)
     sha256: Mapped[str] = mapped_column(String(64), default="")
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utc_now)
 
     message: Mapped[Message] = relationship(back_populates="artifacts")
 
@@ -278,9 +328,9 @@ class HumanRequest(Base):
     secret_name: Mapped[str | None] = mapped_column(String(80), nullable=True)
     status: Mapped[str] = mapped_column(String(16), default="pending")
     response_json: Mapped[str] = mapped_column(Text, default="{}")
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
-    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utc_now)
+    expires_at: Mapped[datetime | None] = mapped_column(UTCDateTime(), nullable=True)
+    resolved_at: Mapped[datetime | None] = mapped_column(UTCDateTime(), nullable=True)
 
     agent: Mapped[Agent] = relationship()
     room: Mapped[Room | None] = relationship()
@@ -297,9 +347,9 @@ class Demonstration(Base):
     sha256: Mapped[str] = mapped_column(String(64), default="")
     learned_reference: Mapped[str] = mapped_column(Text, default="")
     verification_note: Mapped[str] = mapped_column(Text, default="")
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
-    stopped_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utc_now)
+    stopped_at: Mapped[datetime | None] = mapped_column(UTCDateTime(), nullable=True)
+    verified_at: Mapped[datetime | None] = mapped_column(UTCDateTime(), nullable=True)
 
     agent: Mapped[Agent] = relationship()
 
@@ -311,10 +361,10 @@ class OpenLoop(Base):
     agent_id: Mapped[str] = mapped_column(ForeignKey("agent.id"), index=True)
     reason: Mapped[str] = mapped_column(String(160))
     target_id: Mapped[str] = mapped_column(ForeignKey("agent.id"))
-    due_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    due_at: Mapped[datetime] = mapped_column(UTCDateTime(), index=True)
     context_json: Mapped[str] = mapped_column(Text, default="{}")
     status: Mapped[str] = mapped_column(String(16), default="open")
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utc_now)
 
     agent: Mapped[Agent] = relationship(foreign_keys=[agent_id])
 
@@ -328,8 +378,8 @@ class KanbanRef(Base):
     owner_id: Mapped[str] = mapped_column(ForeignKey("agent.id"))
     title: Mapped[str] = mapped_column(String(180))
     last_status: Mapped[str] = mapped_column(String(32), default="todo")
-    last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    last_seen_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utc_now)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utc_now)
 
     room: Mapped[Room] = relationship()
     owner: Mapped[Agent] = relationship()
@@ -351,8 +401,8 @@ class Run(Base):
     model: Mapped[str] = mapped_column(String(160), default="")
     max_turns: Mapped[int] = mapped_column(Integer, default=24)
     max_handoffs: Mapped[int] = mapped_column(Integer, default=6)
-    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
-    ended_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    started_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utc_now)
+    ended_at: Mapped[datetime | None] = mapped_column(UTCDateTime(), nullable=True)
 
     agent: Mapped[Agent] = relationship()
 
@@ -367,4 +417,4 @@ class Activity(Base):
     title: Mapped[str] = mapped_column(String(180))
     detail: Mapped[str] = mapped_column(Text, default="")
     payload_json: Mapped[str] = mapped_column(Text, default="{}")
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utc_now)

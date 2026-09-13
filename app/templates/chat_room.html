@@ -15,10 +15,14 @@
     </form>
   </div>
 {%- endmacro %}
+{% macro artifact_links(message) -%}
+  {% if message.artifacts %}<div class="message-artifacts">{% for artifact in message.artifacts %}<a href="/artifacts/{{ artifact.id }}">[{{ artifact.label }}]</a>{% endfor %}</div>{% endif %}
+{%- endmacro %}
 <section class="chat-pane">
   <header class="chat-header">
     <a class="mobile-back" href="/">&lt; conversations</a>
     <h2>{{ room_label }}</h2>
+    <a class="quiet-link" href="/search?kind=files&amp;room_id={{ room.id }}">files</a>
     {% if room.type == 'channel' %}
     <form class="quiet-action channel-notifications" method="post" action="/channels/{{ room.id }}/notifications">
       <select name="level" aria-label="channel notifications" onchange="this.form.submit()">
@@ -35,13 +39,13 @@
   {% endif %}
   <div class="message-log" data-room="{{ room.id }}">
     {% for message in messages %}
-    <div class="msg" data-message-id="{{ message.id }}">
+    <div class="msg" id="message-{{ message.id }}" data-message-id="{{ message.id }}">
       {{ reaction_controls(message) }}
-      {% if message.artifacts %}<div class="message-artifacts">{% for artifact in message.artifacts %}<a href="/artifacts/{{ artifact.id }}">[{{ artifact.label }}]</a>{% endfor %}</div>{% endif %}
+      {{ artifact_links(message) }}
       <div class="thread-panel" id="thread-{{ message.id }}" data-thread-root="{{ message.id }}" hidden>
         <div class="thread-replies">
           {% for reply in replies_by_root.get(message.id, []) %}
-          <div class="msg thread-reply" data-message-id="{{ reply.id }}">{{ reaction_controls(reply) }}</div>
+          <div class="msg thread-reply" id="message-{{ reply.id }}" data-message-id="{{ reply.id }}">{{ reaction_controls(reply) }}{{ artifact_links(reply) }}</div>
           {% endfor %}
         </div>
         <form class="thread-compose" method="post" action="/rooms/{{ room.id }}/messages">

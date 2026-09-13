@@ -399,7 +399,9 @@ class Toolbelt:
         return {"room": room.id, "lifecycle": room.lifecycle}
 
     async def _context(self, _args: dict) -> dict:
-        return await self.team.load_context(self.actor)
+        context = await self.team.load_context(self.actor)
+        await self.team.acknowledge_context(self.actor, context)
+        return context
 
 
 def tool_schemas() -> list[dict]:

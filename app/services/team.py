@@ -9,7 +9,7 @@ from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import Select, select, text
+from sqlalchemy import Select, case, func, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -28,6 +28,7 @@ from app.models import (
     MessageReaction,
     Notification,
     OpenLoop,
+    PortalDelivery,
     Room,
     RoomRead,
     Routine,
@@ -36,6 +37,7 @@ from app.models import (
     WakeEvent,
 )
 from app.services.auth import upsert_env
+from app.services.context import ContextBudget
 from app.services.filter import decide, mention_names, parse_list
 from app.services.kanban import KanbanBoard
 from app.services.portal import NullPortal, Portal
@@ -702,12 +704,30 @@ class TeamService:
             ).scalars()
         )
         items: list[InboxItem] = []
-        for membership in memberships:
-            room = membership.room
-            if room.lifecycle != "open" or room.type == "task":
-                continue
-            history = await self.history(room.id)
-            last = history[-1] if history else None
+        rooms = [
+            membership.room
+            for membership in memberships
+            if membership.room.lifecycle == "open" and membership.room.type != "task"
+        ]
+        # A sidebar needs one preview, not each room's history and attachments.
+        latest = (
+            select(Message.id)
+            .where(Message.room_id == Room.id)
+            .order_by(Message.created_at.desc(), Message.id.desc())
+            .limit(1)
+            .correlate(Room)
+            .scalar_subquery()
+        )
+        previews = (
+            await self.db.execute(
+                select(Message)
+                .options(selectinload(Message.sender))
+                .where(Message.id.in_(select(latest).where(Room.id.in_([r.id for r in rooms]))))
+            )
+        ).scalars()
+        by_room = {message.room_id: message for message in previews}
+        for room in rooms:
+            last = by_room.get(room.id)
             items.append(InboxItem(room, last, room.id in unread_room_ids))
         return sorted(
             items,
@@ -715,6 +735,25 @@ class TeamService:
                 item.last_message.created_at if item.last_message else item.room.created_at
             ),
             reverse=True,
+        )
+
+    async def inbox_unread_count(self, viewer: Agent) -> int:
+        return int(
+            await self.db.scalar(
+                select(func.count(func.distinct(Notification.room_id)))
+                .join(Room, Room.id == Notification.room_id)
+                .join(
+                    Membership,
+                    (Membership.room_id == Room.id) & (Membership.agent_id == viewer.id),
+                )
+                .where(
+                    Notification.agent_id == viewer.id,
+                    Notification.read_at.is_(None),
+                    Room.lifecycle == "open",
+                    Room.type != "task",
+                )
+            )
+            or 0
         )
 
     async def mark_room_read(self, human: Agent, room_id: str, last_message_id: str | None) -> None:
@@ -792,11 +831,17 @@ class TeamService:
             room_id=room.id,
         )
         await self._notify_for_message(actor, room, message, names)
-        await self._push_portal(actor, room, text_body)
+        await self._queue_portal(actor, room, message)
         return message
 
     async def history(
-        self, room_id: str, limit: int = 80, viewer: Agent | None = None
+        self,
+        room_id: str,
+        limit: int = 80,
+        viewer: Agent | None = None,
+        *,
+        include_thread_roots: bool = False,
+        focus_message_id: str | None = None,
     ) -> list[Message]:
         if viewer is not None:
             await self._require_member(viewer, await self._room(room_id), allow_owner=True)
@@ -808,12 +853,26 @@ class TeamService:
                 selectinload(Message.artifacts),
             )
             .where(Message.room_id == room_id)
-            .order_by(Message.created_at.desc())
+            .order_by(Message.created_at.desc(), Message.id.desc())
             .limit(limit)
         )
         rows = list((await self.db.execute(stmt)).scalars())
-        rows.reverse()
-        return rows
+        if focus_message_id and focus_message_id not in {row.id for row in rows}:
+            focus = await self.db.scalar(stmt.where(Message.id == focus_message_id).limit(1))
+            if focus is None:
+                raise NotFound("Message is unavailable in this room")
+            rows.append(focus)
+        if include_thread_roots:
+            visible_ids = {row.id for row in rows}
+            missing = {
+                row.parent_message_id
+                for row in rows
+                if row.parent_message_id and row.parent_message_id not in visible_ids
+            }
+            if missing:
+                parents = stmt.where(Message.id.in_(missing)).limit(None)
+                rows.extend((await self.db.execute(parents)).scalars())
+        return sorted(rows, key=lambda row: (row.created_at, row.id))
 
     async def search_messages(
         self, actor: Agent, query: str, *, room_id: str | None = None, limit: int = 50
@@ -909,6 +968,32 @@ class TeamService:
             sha256=digest,
         )
         return artifact
+
+    async def list_artifacts(
+        self, actor: Agent, query: str = "", *, room_id: str | None = None
+    ) -> list[Artifact]:
+        allowed = select(Membership.room_id).where(Membership.agent_id == actor.id)
+        stmt = (
+            select(Artifact)
+            .join(Message)
+            .options(selectinload(Artifact.message).selectinload(Message.sender))
+            .where(Message.room_id.in_(allowed))
+        )
+        if room_id:
+            stmt = stmt.where(Message.room_id == room_id)
+        if query.strip():
+            term = query.strip().lower()
+            stmt = stmt.where(
+                func.lower(Artifact.label).contains(term, autoescape=True)
+                | func.lower(Artifact.reference).contains(term, autoescape=True)
+            )
+        return list(
+            (
+                await self.db.execute(
+                    stmt.order_by(Artifact.created_at.desc(), Artifact.id.desc()).limit(100)
+                )
+            ).scalars()
+        )
 
     async def get_artifact(self, actor: Agent, artifact_id: str) -> Artifact:
         artifact = await self.db.get(Artifact, artifact_id)
@@ -1472,7 +1557,15 @@ class TeamService:
                 .limit(1)
             )
         ).scalar_one_or_none()
-        candidates = [item for item in (wake, routine) if item is not None]
+        lease = (
+            await self.db.execute(
+                select(WakeEvent.lease_expires_at)
+                .where(WakeEvent.status == "claimed", WakeEvent.lease_expires_at.is_not(None))
+                .order_by(WakeEvent.lease_expires_at.asc())
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+        candidates = [item for item in (wake, routine, lease) if item is not None]
         return min(candidates) if candidates else None
 
     async def start_run(self, event: WakeEvent) -> Run:
@@ -1572,41 +1665,24 @@ class TeamService:
         await self.db.flush()
         return count
 
-    async def load_context(self, agent: Agent) -> dict:
-        memberships = list(
-            (
-                await self.db.execute(
-                    select(Membership)
-                    .options(selectinload(Membership.room))
-                    .where(Membership.agent_id == agent.id)
-                )
-            ).scalars()
-        )
-        rooms = []
-        for membership in memberships:
-            room = membership.room
-            if room.lifecycle == "archived" and room.type != "task":
-                continue
-            history = await self.history(room.id, limit=20)
-            rooms.append(
-                {
-                    "id": room.id,
-                    "type": room.type,
-                    "title": room.title,
-                    "objective": room.objective,
-                    "lifecycle": room.lifecycle,
-                    "role": membership.role,
-                    "messages": [
-                        {
-                            "id": message.id,
-                            "sender": message.sender.name if message.sender else "",
-                            "body": message.body,
-                            "at": message.created_at.isoformat(),
-                        }
-                        for message in history
-                    ],
-                }
+    async def load_context(
+        self, agent: Agent, *, char_budget: int | None = None, room_id: str | None = None
+    ) -> dict:
+        identity = {
+            "id": agent.id,
+            "name": agent.name,
+            "kind": agent.kind,
+            "profile": agent.hermes_profile,
+        }
+        if char_budget is None:
+            identity.update(
+                role_title=agent.role_title,
+                job_description=agent.job_description,
+                reports_to_id=agent.reports_to_id,
+                capabilities=json.loads(agent.capabilities_json or "[]"),
             )
+        budget = ContextBudget(identity, char_budget)
+        context = budget.data
         notifications = list(
             (
                 await self.db.execute(
@@ -1619,74 +1695,141 @@ class TeamService:
                         Notification.agent_id == agent.id,
                         Notification.delivered_at.is_(None),
                     )
-                    .order_by(Notification.created_at.asc())
-                    .limit(50)
+                    .order_by(Notification.created_at.asc(), Notification.id.asc())
+                    .limit(51)
                 )
             ).scalars()
         )
-        for notification in notifications:
-            notification.delivered_at = self.clock.now()
-        await self.db.flush()
-        return {
-            "agent": {
-                "id": agent.id,
-                "name": agent.name,
-                "kind": agent.kind,
-                "profile": agent.hermes_profile,
-                "role_title": agent.role_title,
-                "job_description": agent.job_description,
-                "reports_to_id": agent.reports_to_id,
-                "capabilities": json.loads(agent.capabilities_json or "[]"),
-            },
-            "rooms": rooms,
-            "notifications": [
+        context["more_available"] = len(notifications) > 50
+        for notification in notifications[:50]:
+            reference = {
+                "id": notification.id,
+                "room_id": notification.room_id,
+                "message_id": notification.message_id,
+            }
+            budget.append(
+                context["notifications"],
                 {
-                    "id": notification.id,
+                    **reference,
                     "kind": notification.kind,
-                    "room_id": notification.room_id,
                     "room": notification.room.title,
-                    "message_id": notification.message_id,
                     "parent_message_id": notification.message.parent_message_id,
                     "sender": notification.message.sender.name,
                     "body": notification.message.body,
                     "at": notification.created_at.isoformat(),
-                }
-                for notification in notifications
-            ],
-            "routines": [
-                {
-                    "id": row.id,
-                    "reason": row.reason,
-                    "source": row.source,
-                    "match_any": parse_list(row.match_any_json),
-                }
-                for row in await self.list_routines(agent.id)
-            ],
-            "open_loops": [
-                {"id": row.id, "reason": row.reason, "due_at": row.due_at.isoformat()}
-                for row in await self.list_loops(agent.id)
-            ],
-            "tasks": [
+                },
+                reference,
+            )
+        for row in await self.list_human_requests(agent_id=agent.id):
+            budget.append(
+                context["human_requests"],
+                {"id": row.id, "kind": row.kind, "prompt": row.prompt, "status": row.status},
+                {"id": row.id, "kind": row.kind},
+            )
+        for row in await self.list_loops(agent.id):
+            budget.append(
+                context["open_loops"],
+                {"id": row.id, "reason": row.reason, "due_at": row.due_at.isoformat()},
+            )
+        tasks = (
+            await self.db.execute(select(KanbanRef).where(KanbanRef.owner_id == agent.id))
+        ).scalars()
+        for row in tasks:
+            budget.append(
+                context["tasks"],
                 {
                     "id": row.id,
                     "hermes_task_id": row.hermes_task_id,
                     "title": row.title,
                     "status": row.last_status,
                     "room_id": row.room_id,
-                }
-                for row in await self.list_tasks()
-                if row.owner_id == agent.id
-            ],
-            "human_requests": [
+                },
+            )
+        for row in await self.list_routines(agent.id):
+            budget.append(
+                context["routines"],
                 {
                     "id": row.id,
-                    "kind": row.kind,
-                    "prompt": row.prompt,
-                    "status": row.status,
-                }
-                for row in await self.list_human_requests(agent_id=agent.id)
-            ],
-        }
+                    "reason": row.reason,
+                    "source": row.source,
+                    "match_any": parse_list(row.match_any_json),
+                },
+            )
+        memberships = list(
+            (
+                await self.db.execute(
+                    select(Membership)
+                    .join(Room)
+                    .options(selectinload(Membership.room))
+                    .where(
+                        Membership.agent_id == agent.id,
+                        (Room.lifecycle != "archived") | (Room.type == "task"),
+                    )
+                    .order_by(
+                        case((Room.id == room_id, 0), else_=1), Room.created_at.desc(), Room.id
+                    )
+                    .limit(9 if char_budget is not None else None)
+                )
+            ).scalars()
+        )
+        if char_budget is not None and len(memberships) > 8:
+            context["more_available"] = True
+            memberships = memberships[:8]
+        for membership in memberships:
+            if budget.remaining < 300:
+                context["more_available"] = True
+                break
+            room = membership.room
+            item = {
+                "id": room.id,
+                "type": room.type,
+                "title": room.title,
+                "objective": room.objective,
+                "lifecycle": room.lifecycle,
+                "role": membership.role,
+                "messages": [],
+            }
+            if not budget.append(context["rooms"], item, {"id": room.id, "title": room.title}):
+                continue
+            # Wake context only consumes sender/body; leave UI relationships unloaded.
+            history = (
+                await self.db.execute(
+                    select(Message)
+                    .options(selectinload(Message.sender))
+                    .where(Message.room_id == room.id)
+                    .order_by(Message.created_at.desc(), Message.id.desc())
+                    .limit(20)
+                )
+            ).scalars()
+            for message in history:
+                budget.append(
+                    item["messages"],
+                    {
+                        "id": message.id,
+                        "sender": message.sender.name if message.sender else "",
+                        "body": message.body,
+                        "at": message.created_at.isoformat(),
+                    },
+                )
+            item["messages"].reverse()
+        return context
+
+    async def acknowledge_context(self, agent: Agent, context: dict) -> None:
+        ids = [
+            item["id"]
+            for item in context.get("notifications", [])
+            if "body" in item and not item.get("reference_only")
+        ]
+        if ids:
+            await self.db.execute(
+                update(Notification)
+                .where(
+                    Notification.id.in_(ids),
+                    Notification.agent_id == agent.id,
+                    Notification.delivered_at.is_(None),
+                )
+                .values(delivered_at=self.clock.now())
+            )
 
     async def create_human_request(
         self,
@@ -1743,6 +1886,16 @@ class TeamService:
             request_id=request.id,
         )
         return request
+
+    async def pending_human_request_count(self) -> int:
+        return int(
+            await self.db.scalar(
+                select(func.count())
+                .select_from(HumanRequest)
+                .where(HumanRequest.status == "pending")
+            )
+            or 0
+        )
 
     async def list_human_requests(
         self, *, agent_id: str | None = None, include_resolved: bool = False
@@ -2114,8 +2267,8 @@ class TeamService:
             notification.wake_event_id = events[notification.agent_id].id
         await self.db.flush()
 
-    async def _push_portal(self, actor: Agent, room: Room, body: str) -> None:
-        if room.type != "dm" or actor.kind == "human":
+    async def _queue_portal(self, actor: Agent, room: Room, message: Message) -> None:
+        if room.type != "dm" or actor.kind == "human" or self.portal.kind == "none":
             return
         members = list(
             (
@@ -2128,7 +2281,16 @@ class TeamService:
         )
         if not any(member.agent.kind == "human" for member in members):
             return
-        await self.portal.push(sender=actor.name, body=body, room_title=room.title)
+        self.db.add(
+            PortalDelivery(
+                message_id=message.id,
+                portal_key=self.portal.delivery_key,
+                recipient=self.portal.recipient or None,
+                next_attempt_at=self.clock.now(),
+                created_at=self.clock.now(),
+            )
+        )
+        await self.db.flush()
 
     async def get_room(self, room_id: str) -> Room:
         room = (

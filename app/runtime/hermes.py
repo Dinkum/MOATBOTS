@@ -9,6 +9,7 @@ from app.config import Settings
 from app.models import Agent, Run, WakeEvent
 from app.runtime.base import Runtime, RuntimeResult
 from app.services.auth import AuthService
+from app.services.context import encode_context
 from app.services.team import TeamService
 
 SESSION_MARK = "session_id:"
@@ -43,9 +44,13 @@ class HermesRuntime(Runtime):
             )
         if not agent.hermes_profile:
             return RuntimeResult("ignore", "agent has no Hermes profile")
-        context = await team.load_context(agent)
-        # Loading context marks delivered notifications. Commit those writes before
-        # Hermes starts so its HTTP tool calls are never blocked by this session.
+        event_payload = json.loads(event.payload_json or "{}")
+        focus_room = event_payload.get("room_id") if isinstance(event_payload, dict) else None
+        context = await team.load_context(
+            agent, char_budget=6000, room_id=focus_room or event.context_reference
+        )
+        # Close the read transaction before Hermes starts. A failed start or run
+        # must leave pending notifications available for the next wake.
         await team.db.commit()
         preferred = next(
             (
@@ -63,7 +68,6 @@ class HermesRuntime(Runtime):
         if preferred:
             provider, model, extra_env = self.auth.hermes_invocation(preferred)
         prompt = _wake_prompt(agent, event, context)
-        event_payload = json.loads(event.payload_json or "{}")
         command = [
             str(binary.resolve()),
             "-p",
@@ -117,6 +121,7 @@ class HermesRuntime(Runtime):
             agent.hermes_session_id = session_id
         if process.returncode != 0:
             return RuntimeResult("error", (diagnostic or text)[-800:])
+        await team.acknowledge_context(agent, context)
         return RuntimeResult(
             "acted",
             text[-800:] or "hermes returned",
@@ -155,6 +160,7 @@ def _wake_prompt(agent: Agent, event: WakeEvent, context: dict) -> str:
         f"Wake reason: {event.reason}\n"
         f"Context ref: {event.context_reference}\n"
         f"Payload: {json.dumps(payload, default=str)}\n\n"
-        f"Office state:\n{json.dumps(context, default=str)[:6000]}\n\n"
+        f"Office state:\n{encode_context(context)}\n\n"
+        "Use context.load for omitted or reference-only entries.\n"
         "Act or stay silent. Then stop."
     )

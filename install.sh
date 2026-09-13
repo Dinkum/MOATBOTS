@@ -24,27 +24,6 @@ if [[ "$os" == Linux && -r /etc/os-release ]]; then
   esac
 fi
 
-need_python() {
-  command -v python3 >/dev/null 2>&1 || return 1
-  python3 - <<'PY'
-import sys
-raise SystemExit(0 if sys.version_info >= (3, 11) else 1)
-PY
-}
-
-if ! need_python; then
-  if [[ "$os" == Darwin ]]; then
-    die "Python 3.11+ is required. brew install python@3.12"
-  fi
-  if command -v apt-get >/dev/null 2>&1; then
-    say "Installing python3.11 via apt..."
-    sudo apt-get update
-    sudo apt-get install -y python3.11 python3.11-venv python3.11-dev git || \
-      sudo apt-get install -y python3 python3-venv python3-pip git
-  fi
-  need_python || die "Python 3.11+ is required"
-fi
-
 command -v docker >/dev/null 2>&1 || die "Docker is required for agent computers"
 docker info >/dev/null 2>&1 || die "Docker is installed but its engine is not running"
 
@@ -54,6 +33,7 @@ if ! command -v uv >/dev/null 2>&1; then
   export PATH="$HOME/.local/bin:$PATH"
 fi
 command -v uv >/dev/null 2>&1 || die "uv is not on PATH. Open a new shell and rerun ./install.sh"
+uv python install 3.12.10
 
 if [[ -d .hermes-home && ! -d .moatbots-agents/chief ]]; then
   mkdir -p .moatbots-agents
@@ -76,12 +56,12 @@ if [[ ! -f config.yaml ]]; then
 fi
 if [[ ! -f .env ]]; then
   umask 077
-  token="$(openssl rand -hex 16 2>/dev/null || python3 -c 'import secrets; print(secrets.token_hex(16))')"
+  token="$(openssl rand -hex 16 2>/dev/null || uv run --python 3.12.10 python -c 'import secrets; print(secrets.token_hex(16))')"
   printf 'MOATBOTS_API_TOKEN=%s\n' "$token" > .env
   say "Wrote .env with a local API token"
 fi
 
-uv sync --locked
+uv sync --locked --python 3.12.10
 
 say "Building the pinned Hermes agent computer..."
 docker compose --profile build build agent-computer

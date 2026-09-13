@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from pathlib import Path
 from typing import Any
 
@@ -46,18 +47,21 @@ async def _ctx(
     **extra,
 ):
     viewer = viewer or await _viewer(request, team)
-    if inbox_items is None:
-        inbox_items = await team.list_inbox(viewer)
-    human_requests = await team.list_human_requests() if viewer.kind == "human" else []
+    inbox_unread = (
+        await team.inbox_unread_count(viewer)
+        if inbox_items is None
+        else sum(item.unread for item in inbox_items)
+    )
+    human_requests = await team.pending_human_request_count() if viewer.kind == "human" else 0
     return {
         "request": request,
         "app_version": request.app.state.version,
         "asset_version": request.app.state.asset_version,
-        "inbox_unread": sum(item.unread for item in inbox_items),
+        "inbox_unread": inbox_unread,
         "viewer": viewer,
         "impersonating": viewer.name != "you",
         "show_heading": show_heading,
-        "human_requests_pending": len(human_requests),
+        "human_requests_pending": human_requests,
         **extra,
     }
 
@@ -143,7 +147,7 @@ async def inbox(request: Request, team: TeamService = Depends(get_team)):
     following = False
     can_manage_channel = False
     if active_room:
-        history = await team.history(active_room.id, viewer=viewer)
+        history = await team.history(active_room.id, viewer=viewer, include_thread_roots=True)
         messages = [message for message in history if message.parent_message_id is None]
         replies_by_root = {
             message.id: [reply for reply in history if reply.parent_message_id == message.id]
@@ -208,7 +212,12 @@ async def start_handoff(request: Request, team: TeamService = Depends(get_team))
 async def room_page(room_id: str, request: Request, team: TeamService = Depends(get_team)):
     room = await team.get_room(room_id)
     viewer = await _viewer(request, team)
-    messages = await team.history(room_id, viewer=viewer)
+    messages = await team.history(
+        room_id,
+        viewer=viewer,
+        include_thread_roots=True,
+        focus_message_id=request.query_params.get("message") or None,
+    )
     tasks = await team.list_tasks(room_id)
     await team.mark_room_read(viewer, room_id, messages[-1].id if messages else None)
     membership = next((member for member in room.memberships if member.agent_id == viewer.id), None)
@@ -417,7 +426,14 @@ async def activity_page(request: Request, team: TeamService = Depends(get_team))
 async def search_page(request: Request, team: TeamService = Depends(get_team)):
     viewer = await _viewer(request, team)
     query = request.query_params.get("q", "").strip()
-    messages = await team.search_messages(viewer, query) if query else []
+    kind = "files" if request.query_params.get("kind") == "files" else "messages"
+    room_id = request.query_params.get("room_id") or None
+    messages = (
+        await team.search_messages(viewer, query, room_id=room_id)
+        if query and kind == "messages"
+        else []
+    )
+    artifacts = await team.list_artifacts(viewer, query, room_id=room_id) if kind == "files" else []
     rooms = {room.id: room for room in await team.list_rooms()}
     return templates.TemplateResponse(
         "search.html",
@@ -427,6 +443,9 @@ async def search_page(request: Request, team: TeamService = Depends(get_team)):
             viewer=viewer,
             query=query,
             messages=messages,
+            artifacts=artifacts,
+            search_kind=kind,
+            search_room_id=room_id,
             rooms=rooms,
             section="search",
             show_heading=True,
@@ -608,9 +627,15 @@ async def settings_page(request: Request, team: TeamService = Depends(get_team))
             request,
             team,
             auth=snap,
-            portal_kind=portal.kind,
-            portal_ready=portal.kind == "telegram",
-            telegram_chat_id=settings.telegram_chat_id or "",
+            portal_kind=settings.portal.kind,
+            portal_waiting=portal.kind == "telegram" and not portal.recipient,
+            portal_error={
+                "token": "Enter a Telegram bot token to enable the portal.",
+                "invalid": "Check the bot token and numeric chat id.",
+            }.get(request.query_params.get("portal_error"), ""),
+            telegram_chat_id=portal.recipient
+            if portal.kind == "telegram"
+            else settings.telegram_chat_id or "",
             section="settings",
         ),
     )
@@ -636,13 +661,23 @@ async def settings_portal(request: Request):
     form = await request.form()
     token = str(form.get("token") or "").strip()
     chat_id = str(form.get("chat_id") or "").strip()
+    kind = "telegram" if form.get("kind") == "telegram" else "none"
+    if (token and not re.fullmatch(r"[0-9]+:[A-Za-z0-9_-]+", token)) or (
+        chat_id and not re.fullmatch(r"-?[0-9]+", chat_id)
+    ):
+        return RedirectResponse("/settings?portal_error=invalid", status_code=303)
+    if kind == "telegram" and not (token or request.app.state.settings.telegram_bot_token):
+        return RedirectResponse("/settings?portal_error=token", status_code=303)
     env_path = Path(".env")
     if token:
         upsert_env(env_path, "MOATBOTS_TELEGRAM_BOT_TOKEN", token)
         os.environ["MOATBOTS_TELEGRAM_BOT_TOKEN"] = token
-    if chat_id:
-        upsert_env(env_path, "MOATBOTS_TELEGRAM_CHAT_ID", chat_id)
-        os.environ["MOATBOTS_TELEGRAM_CHAT_ID"] = chat_id
+    upsert_env(env_path, "MOATBOTS_TELEGRAM_CHAT_ID", chat_id)
+    os.environ["MOATBOTS_TELEGRAM_CHAT_ID"] = chat_id
+    # Persist the selector alongside credentials; this overrides the YAML default.
+    portal_value = json.dumps({"kind": kind})
+    upsert_env(env_path, "MOATBOTS_PORTAL", portal_value)
+    os.environ["MOATBOTS_PORTAL"] = portal_value
     get_settings.cache_clear()
     settings = get_settings()
     request.app.state.settings = settings

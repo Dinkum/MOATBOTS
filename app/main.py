@@ -24,6 +24,7 @@ from app.services.demonstrations import DemonstrationService
 from app.services.desktop import DesktopService
 from app.services.inbox import accept_human_text
 from app.services.kanban import HermesKanban
+from app.services.outbox import PortalOutbox
 from app.services.portal import ManagedPortal, build_portal
 from app.services.profiles import HermesProfileProvisioner
 from app.services.team import NewEventSignal, TeamService
@@ -81,7 +82,7 @@ async def lifespan(app: FastAPI):
         settings.agent_workspace,
     )
 
-    async def on_portal_text(text: str) -> None:
+    async def on_portal_text(text: str, delivery_id: str) -> None:
         default = portal.last_peer or (settings.agents[0].name if settings.agents else "chief")
         async with session_factory() as session:
             team = TeamService(
@@ -95,7 +96,7 @@ async def lifespan(app: FastAPI):
                 settings.agent_state_dir,
                 settings.agent_workspace,
             )
-            peer = await accept_human_text(team, text, default)
+            peer = await accept_human_text(team, text, default, delivery_id=delivery_id)
             portal.last_peer = peer
             await session.commit()
 
@@ -111,6 +112,8 @@ async def lifespan(app: FastAPI):
     app.state.portal = portal
     app.state.profiles = profiles
     app.state.dispatcher = dispatcher
+    outbox = PortalOutbox(session_factory, clock, portal)
+    app.state.outbox = outbox
     app.state.version = APP_VERSION
     app.state.asset_version = ASSET_VERSION
     for key in (
@@ -143,17 +146,22 @@ async def lifespan(app: FastAPI):
     else:
         raise RuntimeError("Agent tool listener did not become ready")
     await portal.start(on_portal_text)
-    tasks = [agent_server_task, asyncio.create_task(dispatcher.run_forever())]
+    dispatcher_task = asyncio.create_task(dispatcher.run_forever())
+    outbox_task = asyncio.create_task(outbox.run_forever())
+    app.state.dispatcher_task = dispatcher_task
+    app.state.outbox_task = outbox_task
+    tasks = [agent_server_task, dispatcher_task, outbox_task]
     emit("app", "startup", "Moatbots started", version=APP_VERSION)
     yield
     dispatcher.stop()
-    await portal.close()
+    outbox.stop()
     agent_server.should_exit = True
     for task in tasks:
         task.cancel()
     for task in tasks:
         with suppress(asyncio.CancelledError):
             await task
+    await portal.close()
     await engine.dispose()
     stop_logging()
 
