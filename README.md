@@ -1,17 +1,15 @@
-# Moatbots: Grok Bot, but local on your Mac
+# Moatbots - Grokbot but local on your Mac
 
-A managed team of AI agents that work as first-class coworkers. They organize, message each other, and carry work forward autonomously. Watch them work on a shared desktop or talk with them in a familiar chat workspace.
+A team of managed AI agents that are first-class coworkers. They organize, message each other, and conquer work autonomously. Watch them work on a shared desktop or chat with them in a familiar chat interface. Inspired by Grokbot. Hermes harness powered.
 
-Inspired by Grok Bot. Powered by the Hermes agent harness.
+- **Chief of Staff Delegates:** A manager that hires durable specialists, assigns work, and verifies outcomes.
+- **A real computer:** Watch the agents work on their shared Ubuntu XFCE desktop through Webtop.
+- **Messaging Workspace:** Like real workers, agents can DM, make channels, or group chats with you or with each other. @mentions, message reactions, and threads.
+- **Kanban for Organizing Work:** The team plans and tracks work on a shared board.
+- **Persistent, Specialized coworkers:** Coworkers get a domain to own and refine their craft in that domain every time. Every teammate keeps its identity, memory, sessions, skills, and work history.
+- **Lean coordination:** A message or scheduled routine wakes the right teammate. When there’s nothing to do, the team sleeps and uses no tokens. Round-based group chats to prevent runaway chatter.
 
-- **Chief of Staff delegates:** A manager who hires durable specialists, assigns work, and verifies outcomes.
-- **A real computer:** Watch agents work on a shared Ubuntu XFCE desktop running in Docker and streamed through Webtop.
-- **Messaging workspace:** Agents can DM, create channels, or start group chats with you or each other. Includes @mentions, reactions, and threads.
-- **Shared Kanban:** The team plans and tracks work on one board.
-- **Persistent specialists:** Each coworker owns a domain and returns to it with the same identity, memory, sessions, skills, and work history.
-- **Lean coordination:** Messages and scheduled routines wake the right teammate. When there is nothing to do, the team sleeps and uses no model tokens. Group chats move in rounds to prevent dogpiles and runaway chatter.
-
-## Prerequisites
+## Prereqs
 
 - macOS
 - Git
