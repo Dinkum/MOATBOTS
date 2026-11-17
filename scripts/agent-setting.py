@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
@@ -11,39 +12,29 @@ from app.services.agent_auth import scoped_agent_token  # noqa: E402
 
 
 def main() -> None:
-    if len(sys.argv) < 2:
-        raise SystemExit("setting name required")
     settings = Settings()
-    name = sys.argv[1]
-    paths = {
-        "state_dir": settings.agent_state_dir,
-        "shared_dir": settings.agent_shared_dir,
-        "auth_dir": settings.agent_auth_dir,
-        "desktop_dir": settings.agent_desktop_dir,
-        "workspace": settings.agent_workspace,
-    }
-    if name in paths:
-        print(Path(paths[name]).expanduser().resolve())
-        return
-    if name == "image":
-        print(settings.agent_image)
-        return
-    if name == "container_name":
-        print(settings.agent_container_name)
-        return
-    if name == "desktop_host":
-        print(settings.agent_desktop_host)
-        return
-    if name == "desktop_port":
-        print(settings.agent_desktop_port)
-        return
-    if name == "api_url":
-        print(settings.agent_api_url)
-        return
-    if name == "token" and len(sys.argv) == 3:
-        print(scoped_agent_token(settings.api_token, sys.argv[2]))
-        return
-    raise SystemExit(f"unknown setting {name}")
+    actor = sys.argv[1]
+    paths = (
+        settings.agent_state_dir,
+        settings.agent_shared_dir,
+        settings.agent_auth_dir,
+        settings.agent_desktop_dir,
+        settings.agent_workspace,
+    )
+    values = [str(Path(path).expanduser().resolve()) for path in paths]
+    values.extend(
+        (
+            settings.agent_image,
+            settings.agent_container_name,
+            settings.agent_desktop_host,
+            str(settings.agent_desktop_port),
+            settings.agent_api_url,
+            scoped_agent_token(settings.api_token, actor) if actor else "",
+        )
+    )
+    if any("\0" in value for value in values):
+        raise SystemExit("Agent computer settings cannot contain NUL bytes")
+    sys.stdout.buffer.write(b"\0".join(os.fsencode(value) for value in values) + b"\0")
 
 
 if __name__ == "__main__":

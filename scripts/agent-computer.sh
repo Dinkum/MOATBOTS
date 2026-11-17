@@ -7,16 +7,36 @@ python="$root/.venv/bin/python"
 [[ -x "$python" ]] || { printf 'Moatbots host environment is missing. Run ./install.sh\n' >&2; exit 1; }
 command -v docker >/dev/null 2>&1 || { printf 'Docker is required for the agent computer.\n' >&2; exit 1; }
 
-setting() { "$python" "$root/scripts/agent-setting.py" "$@"; }
-state_root="$(setting state_dir)"
-shared_root="$(setting shared_dir)"
-auth_root="$(setting auth_dir)"
-desktop_root="$(setting desktop_dir)"
-workspace="$(setting workspace)"
-image="$(setting image)"
-container="$(setting container_name)"
-desktop_host="$(setting desktop_host)"
-desktop_port="$(setting desktop_port)"
+mode="${1:-status}"
+actor=""
+case "$mode" in
+  exec|hermes)
+    actor="${2:-}"
+    [[ "$actor" =~ ^[a-z0-9_]{2,32}$ ]] || { printf 'Invalid agent handle: %s\n' "$actor" >&2; exit 1; }
+    if [[ "$mode" == "exec" && "$#" -lt 3 ]]; then
+      printf 'Agent command required\n' >&2
+      exit 1
+    fi
+    ;;
+esac
+
+load_settings() {
+  IFS= read -r -d '' state_root &&
+    IFS= read -r -d '' shared_root &&
+    IFS= read -r -d '' auth_root &&
+    IFS= read -r -d '' desktop_root &&
+    IFS= read -r -d '' workspace &&
+    IFS= read -r -d '' image &&
+    IFS= read -r -d '' container &&
+    IFS= read -r -d '' desktop_host &&
+    IFS= read -r -d '' desktop_port &&
+    IFS= read -r -d '' api_url &&
+    IFS= read -r -d '' agent_token
+}
+load_settings < <("$python" "$root/scripts/agent-setting.py" "$actor") || {
+  printf 'Could not load agent computer settings.\n' >&2
+  exit 1
+}
 computer_spec="2"
 workspace_port="43129"
 
@@ -104,7 +124,7 @@ start() {
   start_workspace_server
 }
 
-case "${1:-status}" in
+case "$mode" in
   start)
     start
     printf 'http://%s:%s/\n' "$desktop_host" "$desktop_port"
@@ -121,11 +141,8 @@ case "${1:-status}" in
       printf 'missing\n'
     fi
     ;;
-  exec)
-    actor="${2:-}"
-    shift 2 || true
-    [[ "$actor" =~ ^[a-z0-9_]{2,32}$ ]] || { printf 'Invalid agent handle: %s\n' "$actor" >&2; exit 1; }
-    [[ "$#" -gt 0 ]] || { printf 'Agent command required\n' >&2; exit 1; }
+  exec|hermes)
+    shift 2
     start
     local_home="$state_root/$actor"
     mkdir -p "$local_home"
@@ -138,9 +155,9 @@ case "${1:-status}" in
       --env HERMES_KANBAN_DB=/agent/shared/kanban.db
       --env "HERMES_PROFILE=$actor"
       --env "MOATBOTS_ACTOR=$actor"
-      --env "MOATBOTS_API_URL=$(setting api_url)"
+      --env "MOATBOTS_API_URL=$api_url"
       --env "MOATBOTS_WORKSPACE_URL=http://127.0.0.1:$workspace_port"
-      --env "MOATBOTS_AGENT_TOKEN=$(setting token "$actor")"
+      --env "MOATBOTS_AGENT_TOKEN=$agent_token"
       --env XDG_CACHE_HOME=/config/.cache
     )
     if [[ -f "$auth_root/.env" ]]; then
@@ -154,7 +171,21 @@ case "${1:-status}" in
         exec_args+=(--env "$name=${!name}")
       fi
     done
-    docker "${exec_args[@]}" "$container" "$@"
+    if [[ "$mode" == "exec" ]]; then
+      docker "${exec_args[@]}" "$container" "$@"
+    else
+      profile_auth="$local_home/auth.json"
+      shared_auth="$auth_root/auth.json"
+      if [[ -f "$shared_auth" ]]; then
+        install -m 600 "$shared_auth" "$profile_auth"
+      fi
+      status=0
+      docker "${exec_args[@]}" "$container" /opt/hermes-venv/bin/hermes "$@" || status=$?
+      if [[ "${1:-}" == "auth" && -f "$profile_auth" ]]; then
+        install -m 600 "$profile_auth" "$shared_auth"
+      fi
+      exit "$status"
+    fi
     ;;
   *)
     printf 'usage: %s {start|stop|status|exec HANDLE COMMAND...}\n' "$0" >&2

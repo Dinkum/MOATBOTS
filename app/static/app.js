@@ -287,7 +287,10 @@
     container.insertBefore(item, next || null);
   };
 
-  window.setInterval(async () => {
+  let polling = false;
+  const poll = async () => {
+    if (document.hidden || polling) return;
+    polling = true;
     try {
       const keepLatestVisible = room.scrollHeight - room.scrollTop - room.clientHeight < 48;
       const response = await fetch(`/api/rooms/${id}/messages`);
@@ -329,6 +332,10 @@
       if (keepLatestVisible) scrollToLatest();
     } catch {
       // A local server restart is expected to interrupt an occasional poll.
+    } finally {
+      polling = false;
     }
-  }, 4000);
+  };
+  window.setInterval(poll, 4000);
+  document.addEventListener("visibilitychange", poll);
 })();

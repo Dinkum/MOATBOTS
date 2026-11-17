@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
-from contextlib import asynccontextmanager, suppress
+from contextlib import asynccontextmanager
 from pathlib import Path
 from uuid import uuid4
 
@@ -33,6 +33,11 @@ APP_VERSION = json.loads(Path("version.json").read_text(encoding="utf-8"))["vers
 ASSET_VERSION = hashlib.sha256(
     b"".join(Path(path).read_bytes() for path in ("app/static/app.css", "app/static/app.js"))
 ).hexdigest()[:12]
+
+
+def log_dispatcher_failure(task: asyncio.Task[None]) -> None:
+    if not task.cancelled() and (error := task.exception()) is not None:
+        emit("dispatcher", "loop.error", str(error), error_type=type(error).__name__)
 
 
 @asynccontextmanager
@@ -68,6 +73,7 @@ async def lifespan(app: FastAPI):
             settings.agent_workspace,
         )
         await seed_roster(session, settings, team)
+        await team.cancel_retired_work()
         await session.commit()
     dispatcher = Dispatcher(
         session_factory,
@@ -147,6 +153,7 @@ async def lifespan(app: FastAPI):
         raise RuntimeError("Agent tool listener did not become ready")
     await portal.start(on_portal_text)
     dispatcher_task = asyncio.create_task(dispatcher.run_forever())
+    dispatcher_task.add_done_callback(log_dispatcher_failure)
     outbox_task = asyncio.create_task(outbox.run_forever())
     app.state.dispatcher_task = dispatcher_task
     app.state.outbox_task = outbox_task
@@ -158,9 +165,7 @@ async def lifespan(app: FastAPI):
     agent_server.should_exit = True
     for task in tasks:
         task.cancel()
-    for task in tasks:
-        with suppress(asyncio.CancelledError):
-            await task
+    await asyncio.gather(*tasks, return_exceptions=True)
     await portal.close()
     await engine.dispose()
     stop_logging()

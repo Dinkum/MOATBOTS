@@ -237,7 +237,7 @@ async def test_group_responses_are_collected_before_the_next_round(world):
 
         researcher_event.status = "claimed"
         researcher_run = await team.start_run(researcher_event)
-        await team.ignore_event(researcher_event, researcher_run, "nothing to add")
+        await team.complete_event(researcher_event, researcher_run, "ignore", "nothing to add")
         await team.settle_group_round(researcher_event)
 
         events = list((await team.db.execute(select(WakeEvent))).scalars())
@@ -250,7 +250,7 @@ async def test_group_responses_are_collected_before_the_next_round(world):
 
         second_round[0].status = "claimed"
         final_run = await team.start_run(second_round[0])
-        await team.ignore_event(second_round[0], final_run, "nothing to add")
+        await team.complete_event(second_round[0], final_run, "ignore", "nothing to add")
         await team.settle_group_round(second_round[0])
         assert not [
             event

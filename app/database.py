@@ -1,11 +1,29 @@
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from pathlib import Path
 
 from sqlalchemy import event, text
 from sqlalchemy.engine import Engine
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.orm import Session, SessionTransaction
 
 from app.models import Base
+
+
+def on_commit(session: AsyncSession, callback: Callable[[], None]) -> None:
+    session.info.setdefault("on_commit", set()).add(callback)
+
+
+@event.listens_for(Session, "after_commit")
+def run_commit_callbacks(session: Session) -> None:
+    if not session.in_nested_transaction():
+        for callback in session.info.pop("on_commit", ()):
+            callback()
+
+
+@event.listens_for(Session, "after_transaction_end")
+def clear_commit_callbacks(session: Session, transaction: SessionTransaction) -> None:
+    if transaction.parent is None:
+        session.info.pop("on_commit", None)
 
 
 @event.listens_for(Engine, "connect")

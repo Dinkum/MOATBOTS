@@ -5,8 +5,8 @@ import asyncio
 from app.clock import Clock
 from app.config import BudgetSettings
 from app.logger import emit
-from app.models import WakeEvent
-from app.runtime.base import Runtime
+from app.models import Run, WakeEvent
+from app.runtime.base import Runtime, RuntimeResult
 from app.services.kanban import KanbanBoard
 from app.services.portal import NullPortal, Portal
 from app.services.profiles import ProfileProvisioner, UnavailableProfileProvisioner
@@ -83,45 +83,48 @@ class Dispatcher:
     async def _run_claimed(self, event_id: str) -> None:
         async with self._capacity, self.session_factory() as session:
             event = await session.get(WakeEvent, event_id)
-            if event is None:
+            if event is None or event.status != "claimed":
                 return
             lane = self._shared_computer if event.execution_lane == "shared" else _NullLane()
             async with lane:
                 team = self._team(session)
                 try:
                     await self._handle(team, event)
-                except asyncio.CancelledError:
-                    await team.release_claim(event, "Dispatcher stopped during the run")
                     await session.commit()
+                except asyncio.CancelledError:
+                    await session.rollback()
+                    event = await session.get(WakeEvent, event_id)
+                    if event is not None and event.status == "claimed":
+                        await team.release_claim(event, "Dispatcher stopped during the run")
+                        await session.commit()
                     raise
-                await session.commit()
 
     async def _handle(self, team: TeamService, event: WakeEvent) -> None:
-        agent = await team.get_agent(event.target_id)
         run = await team.start_run(event)
+        if run is None:
+            return
+        agent = await team.get_agent(event.target_id)
+        agent_name, event_id, run_id = agent.name, event.id, run.id
         # Release the write lock before a Hermes subprocess so MCP/UI can commit.
         await team.db.commit()
         try:
             result = await self.runtime.run(team, agent, event, run)
         except Exception as exc:
-            await team.ignore_event(event, run, str(exc)[:400])
-            await team.settle_group_round(event)
-            emit("dispatcher", "run.error", str(exc), agent=agent.name)
-            return
+            await team.db.rollback()
+            event = await team.db.get_one(WakeEvent, event_id)
+            run = await team.db.get_one(Run, run_id)
+            result = RuntimeResult("error", str(exc)[:400] or type(exc).__name__)
         run.turns_used = result.turns
         run.cost_usd = result.cost_usd
         run.provider = result.provider
         run.model = result.model
-        if result.decision == "ignore":
-            await team.ignore_event(event, run, result.note)
-        else:
-            await team.complete_event(event, run, result.decision, result.note)
+        await team.complete_event(event, run, result.decision, result.note)
         await team.settle_group_round(event)
         emit(
             "dispatcher",
-            "run.done",
-            f"{agent.name} {result.decision}",
-            agent=agent.name,
+            "run.error" if result.decision == "error" else "run.done",
+            result.note if result.decision == "error" else f"{agent_name} {result.decision}",
+            agent=agent_name,
             decision=result.decision,
         )
 

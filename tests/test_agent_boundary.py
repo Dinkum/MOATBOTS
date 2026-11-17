@@ -1,13 +1,16 @@
+import asyncio
 from pathlib import Path
 from types import SimpleNamespace
 
+import httpx
 import pytest
 import yaml
-from fastapi import HTTPException
+from fastapi import FastAPI, HTTPException
 
 from app.config import Settings
 from app.main import agent_app, app
 from app.routes.agent_api import _require_agent
+from app.routes.api import router
 from app.services.agent_auth import scoped_agent_token, valid_agent_token
 from app.services.desktop import DesktopService
 
@@ -40,6 +43,33 @@ def test_host_and_agent_surfaces_are_separate():
     assert agent_paths == {"/health", "/api/tools", "/api/tools/{name}"}
 
 
+async def test_host_health_reports_an_exited_dispatcher():
+    office = FastAPI()
+    office.include_router(router)
+    office.state.settings = Settings()
+    office.state.version = "test"
+    office.state.auth = SimpleNamespace(
+        snapshot=lambda: SimpleNamespace(
+            selected="test", method=lambda _: SimpleNamespace(ready=True)
+        )
+    )
+    stop = asyncio.Event()
+    office.state.dispatcher_task = asyncio.create_task(stop.wait())
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=office), base_url="http://test"
+    ) as client:
+        try:
+            ready = await client.get("/health")
+            assert ready.status_code == 200
+            assert ready.json()["dispatcher_running"]
+        finally:
+            stop.set()
+            await office.state.dispatcher_task
+        down = await client.get("/health")
+        assert down.status_code == 503
+        assert not down.json()["ok"]
+
+
 def test_agent_callback_uses_reserved_uncommon_port():
     settings = Settings()
     assert settings.port == 8080
@@ -68,7 +98,8 @@ def test_compose_builds_an_agent_image_without_exposing_the_office():
 def test_shared_computer_mounts_work_surfaces_without_control_plane_state():
     wrapper = Path("scripts/hermes-docker.sh").read_text(encoding="utf-8")
     computer = Path("scripts/agent-computer.sh").read_text(encoding="utf-8")
-    assert 'exec "$actor" /opt/hermes-venv/bin/hermes' in wrapper
+    assert 'agent-computer.sh" hermes "$actor" "$@"' in wrapper
+    assert '"$container" /opt/hermes-venv/bin/hermes "$@"' in computer
     assert "dst=/config" in computer
     assert "dst=/agents" in computer
     assert "dst=/agent/shared" in computer

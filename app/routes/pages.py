@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -162,7 +163,7 @@ async def inbox(request: Request, team: TeamService = Depends(get_team)):
         can_manage_channel = active_room.type == "channel" and (
             viewer.name == "you" or (membership is not None and membership.role == "owner")
         )
-        items = await team.list_inbox(viewer)
+        items[0] = replace(items[0], unread=False)
     conversations = _conversation_rows(items, viewer.id)
     teammates = [agent for agent in await team.list_agents() if agent.id != viewer.id]
     selected = request.query_params.get("to", request.app.state.settings.primary_agent)

@@ -15,6 +15,7 @@ from sqlalchemy.orm import selectinload
 
 from app.clock import Clock
 from app.config import BudgetSettings
+from app.database import on_commit
 from app.errors import BudgetExceeded, NotFound, SelfWakeRejected, TeamError
 from app.models import (
     Activity,
@@ -287,11 +288,16 @@ class TeamService:
         agent = await self.get_agent(name.removeprefix("@"))
         if agent.name == "chief":
             raise TeamError("Chief cannot retire the root agent")
+        if agent.kind != "hermes":
+            raise TeamError("Only teammates can be retired")
+        if agent.retired_at is not None:
+            return agent
         for report in await self.list_agents():
             if report.reports_to_id == agent.id:
                 report.reports_to_id = actor.id
         agent.retired_at = self.clock.now()
         agent.status = "retired"
+        await self.cancel_retired_work(agent.id)
         await self.record(
             "agent.retire",
             f"Chief retired @{agent.name}",
@@ -300,6 +306,34 @@ class TeamService:
         )
         await self.db.flush()
         return agent
+
+    async def cancel_retired_work(self, agent_id: str | None = None) -> None:
+        retired = select(Agent.id).where(Agent.kind == "hermes", Agent.retired_at.is_not(None))
+        if agent_id is not None:
+            retired = retired.where(Agent.id == agent_id)
+        await self.db.execute(
+            update(Routine)
+            .where(Routine.agent_id.in_(retired), Routine.active == 1)
+            .values(active=0, next_due_at=None, updated_at=self.clock.now())
+        )
+        await self.db.execute(
+            update(OpenLoop)
+            .where(OpenLoop.target_id.in_(retired), OpenLoop.status == "open")
+            .values(status="cancelled")
+        )
+        events = await self.db.scalars(
+            select(WakeEvent).where(
+                WakeEvent.target_id.in_(retired),
+                WakeEvent.status.in_(("pending", "claimed")),
+                ~select(Run.id)
+                .where(Run.wake_event_id == WakeEvent.id, Run.status == "running")
+                .exists(),
+            )
+        )
+        for event in events:
+            event.status = "cancelled"
+            event.lease_expires_at = None
+            await self.settle_group_round(event)
 
     async def _reports_to(self, agent: Agent, possible_manager_id: str) -> bool:
         manager_id = agent.reports_to_id
@@ -1094,6 +1128,8 @@ class TeamService:
         max_runs: int | None = None,
         expires_at=None,
     ) -> Routine:
+        if actor.retired_at is not None:
+            raise TeamError(f"@{actor.name} is retired")
         if not source and interval_seconds <= 0:
             raise TeamError("A routine needs an event source or positive interval")
         if max_runs is not None and max_runs < 1:
@@ -1119,7 +1155,7 @@ class TeamService:
         self.db.add(routine)
         await self.db.flush()
         await self.record("routine", f"Routine {reason}", source, actor_id=actor.id)
-        self.signal.notify()
+        on_commit(self.db, self.signal.notify)
         return routine
 
     async def list_routines(
@@ -1145,7 +1181,12 @@ class TeamService:
         expires_at=None,
     ) -> Routine:
         routine = await self.db.get(Routine, routine_id)
-        if routine is None or routine.agent_id != actor.id or routine.retired_at is not None:
+        if (
+            routine is None
+            or routine.agent_id != actor.id
+            or routine.retired_at is not None
+            or actor.retired_at is not None
+        ):
             raise NotFound(f"Unknown routine {routine_id}")
         if active is not None:
             routine.active = int(active)
@@ -1166,7 +1207,7 @@ class TeamService:
             f"Routine {routine.id} {'active' if routine.active else 'paused'}",
             actor_id=actor.id,
         )
-        self.signal.notify()
+        on_commit(self.db, self.signal.notify)
         return routine
 
     async def retire_routine(self, actor: Agent, routine_id: str) -> Routine:
@@ -1179,6 +1220,7 @@ class TeamService:
         routine.updated_at = self.clock.now()
         await self.db.flush()
         await self.record("routine.retire", f"Retired routine {routine.id}", actor_id=actor.id)
+        on_commit(self.db, self.signal.notify)
         return routine
 
     async def run_routine(self, actor: Agent, routine_id: str) -> WakeEvent:
@@ -1227,6 +1269,10 @@ class TeamService:
             return None
         agent = await self.db.get(Agent, routine.agent_id)
         if agent is None:
+            return None
+        if agent.retired_at is not None:
+            routine.active = 0
+            routine.next_due_at = None
             return None
         event_key = dedupe_key or f"routine:{routine.id}:{trigger}:{_hash(payload)}"
         existing = (
@@ -1419,7 +1465,7 @@ class TeamService:
             actor_id=actor.id if actor else None,
             event_id=event.id,
         )
-        self.signal.notify()
+        on_commit(self.db, self.signal.notify)
         return event
 
     async def claim_due_events(self, limit: int = 16) -> list[WakeEvent]:
@@ -1450,30 +1496,27 @@ class TeamService:
                 abandoned.decision = "lease_expired"
                 abandoned.note = "Dispatcher lease expired before completion"
                 abandoned.ended_at = now
-            event.status = "pending"
-            event.claimed_run_id = None
-            event.claimed_at = None
-            event.lease_expires_at = None
-            agent = await self.db.get(Agent, event.target_id)
-            if agent:
-                agent.status = "idle"
+            await self._requeue_claim(event)
         rows = list(
-            (
-                await self.db.execute(
-                    select(WakeEvent)
-                    .where(WakeEvent.status == "pending", WakeEvent.due_at <= now)
-                    .order_by(WakeEvent.due_at.asc())
-                    .limit(max(16, limit * 8))
-                )
-            ).scalars()
+            await self.db.execute(
+                select(WakeEvent, Agent.retired_at)
+                .join(Agent, Agent.id == WakeEvent.target_id)
+                .where(WakeEvent.status == "pending", WakeEvent.due_at <= now)
+                .order_by(WakeEvent.due_at.asc())
+                .limit(max(16, limit * 8))
+            )
         )
         claimed: list[WakeEvent] = []
         seen: set[str] = set()
         seen_targets: set[str] = set()
         claimed_shared = False
-        for event in rows:
+        for event, retired_at in rows:
             if len(claimed) >= limit:
                 break
+            if retired_at is not None:
+                event.status = "cancelled"
+                await self.settle_group_round(event)
+                continue
             if event.dedupe_key and event.dedupe_key in seen:
                 event.status = "ignored"
                 continue
@@ -1499,29 +1542,13 @@ class TeamService:
     async def complete_event(
         self, event: WakeEvent, run: Run, decision: str, note: str = ""
     ) -> None:
-        event.status = "done"
+        status = {"ignore": "ignored", "error": "error"}.get(decision, "done")
+        event.status = run.status = status
         event.lease_expires_at = None
-        run.status = "done"
         run.decision = decision
         run.note = note
         run.ended_at = self.clock.now()
-        agent = await self.db.get(Agent, event.target_id)
-        if agent:
-            agent.status = "idle"
-        await self.db.flush()
-
-    async def ignore_event(self, event: WakeEvent, run: Run | None, note: str) -> None:
-        event.status = "ignored"
-        event.lease_expires_at = None
-        if run:
-            run.status = "ignored"
-            run.decision = "ignore"
-            run.note = note
-            run.ended_at = self.clock.now()
-        agent = await self.db.get(Agent, event.target_id)
-        if agent:
-            agent.status = "idle"
-        await self.db.flush()
+        await self._set_active_agent_status(event.target_id, "idle")
 
     async def release_claim(self, event: WakeEvent, note: str) -> None:
         run = await self.db.get(Run, event.claimed_run_id) if event.claimed_run_id else None
@@ -1530,15 +1557,27 @@ class TeamService:
             run.decision = "cancelled"
             run.note = note
             run.ended_at = self.clock.now()
-        event.status = "pending"
+        await self._requeue_claim(event)
+        await self.db.flush()
+        on_commit(self.db, self.signal.notify)
+
+    async def _requeue_claim(self, event: WakeEvent) -> None:
+        active = await self._set_active_agent_status(event.target_id, "idle")
+        event.status = "pending" if active else "cancelled"
         event.claimed_at = None
         event.claimed_run_id = None
         event.lease_expires_at = None
-        agent = await self.db.get(Agent, event.target_id)
-        if agent:
-            agent.status = "idle"
-        await self.db.flush()
-        self.signal.notify()
+        if not active:
+            await self.settle_group_round(event)
+
+    async def _set_active_agent_status(self, agent_id: str, status: str) -> bool:
+        updated = await self.db.scalar(
+            update(Agent)
+            .where(Agent.id == agent_id, Agent.retired_at.is_(None))
+            .values(status=status)
+            .returning(Agent.id)
+        )
+        return updated is not None
 
     async def earliest_due(self):
         wake = (
@@ -1568,7 +1607,9 @@ class TeamService:
         candidates = [item for item in (wake, routine, lease) if item is not None]
         return min(candidates) if candidates else None
 
-    async def start_run(self, event: WakeEvent) -> Run:
+    async def start_run(self, event: WakeEvent) -> Run | None:
+        if not await self._set_active_agent_status(event.target_id, "running"):
+            return None
         run = Run(
             agent_id=event.target_id,
             wake_event_id=event.id,
@@ -1580,9 +1621,6 @@ class TeamService:
         self.db.add(run)
         await self.db.flush()
         event.claimed_run_id = run.id
-        agent = await self.db.get(Agent, event.target_id)
-        if agent:
-            agent.status = "running"
         await self.db.flush()
         return run
 
@@ -1649,7 +1687,7 @@ class TeamService:
                 "interval",
                 {"scheduled_for": routine.next_due_at.isoformat()},
             )
-            if routine.interval_seconds:
+            if routine.active and routine.interval_seconds:
                 routine.next_due_at = now + timedelta(seconds=routine.interval_seconds)
             count += 1
         loops = list(

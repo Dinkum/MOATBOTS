@@ -3,13 +3,155 @@ from __future__ import annotations
 import asyncio
 from contextlib import suppress
 
+import pytest
 from sqlalchemy import select
 
-from app.models import Run, WakeEvent
+from app.errors import TeamError
+from app.models import Agent, OpenLoop, Routine, Run, WakeEvent
 from app.runtime.base import Runtime, RuntimeResult
 from app.services.kanban import HermesKanban
 from app.services.team import TeamService
 from tests.conftest import open_team
+
+
+async def test_idle_dispatcher_sees_a_wake_only_after_commit(world, monkeypatch):
+    dispatcher = world["dispatcher"]
+    signal = world["signal"]
+    sleeping = asyncio.Event()
+    started = asyncio.Event()
+    wait = signal.wait
+
+    async def wait_for_signal(timeout):
+        assert timeout is None
+        sleeping.set()
+        await wait(timeout)
+
+    async def run(*args):
+        started.set()
+        return RuntimeResult("acted")
+
+    monkeypatch.setattr(signal, "wait", wait_for_signal)
+    monkeypatch.setattr(dispatcher.runtime, "run", run)
+    dispatch = asyncio.create_task(dispatcher.run_forever())
+    try:
+        await asyncio.wait_for(sleeping.wait(), 2)
+        async with open_team(world) as team:
+            chief = await team.get_agent("chief")
+            await team.create_routine(chief, "aborted", interval_seconds=60)
+            await team.db.rollback()
+            await team.db.commit()
+            assert not signal.event.is_set()
+            chief = await team.get_agent("chief")
+            you = await team.get_agent("you")
+            dm = await team.get_or_create_dm(you, chief)
+            await team.send_message(you, dm.id, "Please take a look")
+            assert not signal.event.is_set()
+        await asyncio.wait_for(started.wait(), 2)
+    finally:
+        dispatcher.stop()
+        await asyncio.wait_for(dispatch, 2)
+
+
+async def test_retirement_cancels_queued_work_before_run_admission(world):
+    async with open_team(world) as team:
+        chief = await team.get_agent("chief")
+        worker = await team.upsert_agent("worker", kind="hermes")
+        routine = await team.create_routine(worker, "interval", interval_seconds=60)
+        due = await team.enqueue_wake(target=worker, actor=chief, reason="ready")
+        later = world["clock"].advance(seconds=1)
+        loop = await team.schedule_loop(chief, "later", worker.name, later)
+        await team.claim_due_events(limit=1)
+
+    async with open_team(world) as claimant:
+        claimed = await claimant.db.get_one(WakeEvent, due.id)
+        assert claimed.status == "claimed"
+        async with open_team(world) as team:
+            chief = await team.get_agent("chief")
+            with pytest.raises(TeamError, match="Only teammates"):
+                await team.retire_agent(chief, "you")
+            await team.retire_agent(chief, worker.name)
+        assert await claimant.start_run(claimed) is None
+
+    world["clock"].advance(seconds=61)
+    assert await world["dispatcher"].drain() == 0
+    async with open_team(world) as team:
+        assert {row.status for row in await team.db.scalars(select(WakeEvent))} == {"cancelled"}
+        saved = await team.db.get_one(Routine, routine.id)
+        assert (saved.active, saved.next_due_at) == (0, None)
+        assert (await team.db.get_one(OpenLoop, loop.id)).status == "cancelled"
+        assert await team.earliest_due() is None
+
+
+async def test_startup_clears_work_left_by_previously_retired_agents(world):
+    async with open_team(world) as team:
+        worker = await team.upsert_agent("worker", kind="hermes")
+        routine = await team.create_routine(worker, "legacy interval", interval_seconds=60)
+        event = await team.enqueue_wake(target=worker, actor=None, reason="legacy wake")
+        worker.retired_at = world["clock"].now()
+        worker.status = "retired"
+
+    async with open_team(world) as team:
+        await team.cancel_retired_work()
+        assert await team.earliest_due() is None
+        assert (await team.db.get_one(WakeEvent, event.id)).status == "cancelled"
+        assert not (await team.db.get_one(Routine, routine.id)).active
+
+
+@pytest.mark.parametrize("outcome", ["done", "cancelled", "lease_expired"])
+async def test_run_settlement_preserves_retirement(world, outcome):
+    async with open_team(world) as team:
+        worker = await team.upsert_agent("worker", kind="hermes")
+        event = await team.enqueue_wake(target=worker, actor=None, reason="test")
+        await team.claim_due_events()
+        run = await team.start_run(event)
+
+    async with open_team(world) as running:
+        await running.db.get_one(Agent, worker.id)
+        event = await running.db.get_one(WakeEvent, event.id)
+        run = await running.db.get_one(Run, run.id)
+        async with open_team(world) as team:
+            chief = await team.get_agent("chief")
+            await team.retire_agent(chief, worker.name)
+            assert (await team.db.get_one(WakeEvent, event.id)).status == "claimed"
+        if outcome == "done":
+            await running.complete_event(event, run, "acted")
+        elif outcome == "cancelled":
+            await running.release_claim(event, "shutdown")
+        else:
+            world["clock"].advance(seconds=world["budgets"].wake_lease_seconds + 1)
+            assert await running.claim_due_events() == []
+
+    async with open_team(world) as team:
+        assert (await team.db.get_one(Agent, worker.id)).status == "retired"
+        assert (await team.db.get_one(WakeEvent, event.id)).status == (
+            "done" if outcome == "done" else "cancelled"
+        )
+        saved = await team.db.get_one(Run, run.id)
+        assert saved.status == ("error" if outcome == "lease_expired" else outcome)
+
+
+@pytest.mark.parametrize("raises", [False, True])
+async def test_runtime_failures_are_terminal_errors(world, monkeypatch, raises):
+    async def fail(team, agent, event, run):
+        if raises:
+            raise RuntimeError("Hermes failed")
+        return RuntimeResult("error", "Hermes failed")
+
+    dispatcher = world["dispatcher"]
+    monkeypatch.setattr(dispatcher.runtime, "run", fail)
+    async with open_team(world) as team:
+        chief = await team.get_agent("chief")
+        event = await team.enqueue_wake(target=chief, actor=None, reason="test")
+    assert await dispatcher.drain() == 1
+    async with open_team(world) as team:
+        event = await team.db.get_one(WakeEvent, event.id)
+        run = await team.db.get_one(Run, event.claimed_run_id)
+        assert (event.status, run.status, run.decision, run.note) == (
+            "error",
+            "error",
+            "error",
+            "Hermes failed",
+        )
 
 
 async def test_expired_claim_is_recovered_and_previous_run_is_closed(world):

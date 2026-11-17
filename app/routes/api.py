@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Request
+from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response
 from pydantic import BaseModel, Field
 
 from app.clock import utc_iso
@@ -47,11 +47,15 @@ def _require_token(request: Request, authorization: str | None) -> None:
 
 
 @router.get("/health")
-async def health(request: Request):
+async def health(request: Request, response: Response):
+    dispatcher_running = not request.app.state.dispatcher_task.done()
+    if not dispatcher_running:
+        response.status_code = 503
     snap = request.app.state.auth.snapshot()
     inference = snap.method(snap.selected)
     return {
-        "ok": True,
+        "ok": dispatcher_running,
+        "dispatcher_running": dispatcher_running,
         "version": request.app.state.version,
         "hermes": Path(request.app.state.settings.hermes_binary).is_file(),
         "inference": snap.selected,
